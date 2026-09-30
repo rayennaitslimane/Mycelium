@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)
-project(pqdos LANGUAGES CXX)
+project(myc LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,7 @@ find_package(httplib REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(Threads REQUIRED)
 
-add_library(pqdos
+add_library(myc
     core/ErasureCodec.cpp
     core/Crypto.cpp
     core/MetadataStore.cpp
@@ -29,11 +29,11 @@ add_library(pqdos
     core/StorageClientServer.cpp
 )
 
-target_include_directories(pqdos PUBLIC
+target_include_directories(myc PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
-target_link_libraries(pqdos PUBLIC
+target_link_libraries(myc PUBLIC
     isa-l::isa-l
     libpqxx::pqxx
     botan::botan
@@ -47,19 +47,19 @@ target_link_libraries(pqdos PUBLIC
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
-    add_executable(pqdos_unit_tests
+    add_executable(myc_unit_tests
         tests/ErasureCodecTest.cpp
         tests/CryptoTest.cpp
     )
 
-    target_link_libraries(pqdos_unit_tests PRIVATE
-        pqdos
+    target_link_libraries(myc_unit_tests PRIVATE
+        myc
         GTest::gtest_main
     )
 
-    add_test(NAME pqdos_unit_tests COMMAND pqdos_unit_tests)
+    add_test(NAME myc_unit_tests COMMAND myc_unit_tests)
 
-    add_executable(pqdos_integration_tests
+    add_executable(myc_integration_tests
         tests/MetadataStoreTest.cpp
         tests/StorageNodeTest.cpp
         tests/StorageNodeServerTest.cpp
@@ -67,31 +67,31 @@ if(BUILD_TESTING)
         tests/StorageClientServerTest.cpp
     )
 
-    target_link_libraries(pqdos_integration_tests
+    target_link_libraries(myc_integration_tests
         PRIVATE
-            pqdos
+            myc
             GTest::gtest_main
     )
 
     add_test(
-        NAME pqdos_integration_tests
-        COMMAND pqdos_integration_tests
+        NAME myc_integration_tests
+        COMMAND myc_integration_tests
     )
 endif()
 
 add_executable(storage_node cmd/StorageNodeMain.cpp)
-target_link_libraries(storage_node PRIVATE pqdos)
+target_link_libraries(storage_node PRIVATE myc)
 
 add_executable(storage_client cmd/StorageClientMain.cpp)
-target_link_libraries(storage_client PRIVATE pqdos)
+target_link_libraries(storage_client PRIVATE myc)
 
 add_executable(benchmark cmd/BenchmarkMain.cpp)
-target_link_libraries(benchmark PRIVATE pqdos)
+target_link_libraries(benchmark PRIVATE myc)
 
 add_executable(metadata_benchmark cmd/MetadataBenchmarkMain.cpp)
-target_link_libraries(metadata_benchmark PRIVATE pqdos)
+target_link_libraries(metadata_benchmark PRIVATE myc)
 
-install(TARGETS pqdos storage_node storage_client
+install(TARGETS myc storage_node storage_client
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin

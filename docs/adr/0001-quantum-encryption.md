@@ -5,7 +5,7 @@
 
 ## Context
 
-pqdos must protect stored objects against both classical and quantum adversaries. The system needs:
+myc must protect stored objects against both classical and quantum adversaries. The system needs:
 - Confidentiality for data at rest across multiple storage nodes
 - A key hierarchy that limits blast radius (a single compromised node must not expose all objects)
 - Key management that can survive key compromise via rotation without re-encrypting all stored data immediately
@@ -21,7 +21,7 @@ The design must be implementable today without waiting for full NIST PQC standar
 - Each shard of the object is encrypted independently with **AES-256-GCM** using that DEK.
 - The DEK is wrapped using an **ML-KEM-768 Key Encryption Key (KEK)** through Botan's KEM API: the code encapsulates a shared secret with `PK_KEM_Encryptor` (`HKDF(SHA-256)`), then encrypts the DEK with **AES-256-GCM** under that shared secret.
 - The wrapped DEK is stored in PostgreSQL alongside the object metadata, not in the shard nodes.
-- The active KEK private key lives on disk at a configurable path (default `/tmp/pqdos_kek.json`, overridable via `PQDOS_KEYSTORE_PATH`), written with `0600` file permissions and `0700` on the parent directory.
+- The active KEK private key lives on disk at a configurable path (default `/tmp/myc_kek.json`, overridable via `MYC_KEYSTORE_PATH`), written with `0600` file permissions and `0700` on the parent directory.
 
 ### Shard index as AEAD associated data
 
@@ -69,6 +69,6 @@ On `get()`, the code first attempts to decrypt the wrapped DEK using the KEK ID 
 
 **Negative / Risks:**
 - The KEK file on disk is the single point of failure for the entire key ring. If it is lost and no backup exists, all objects become unrecoverable. Backup strategy is out of scope for this POC.
-- The default keystore path (`/tmp/pqdos_kek.json`) is in a world-accessible directory. The `PQDOS_KEYSTORE_PATH` environment variable must be set in any environment beyond local testing.
+- The default keystore path (`/tmp/myc_kek.json`) is in a world-accessible directory. The `MYC_KEYSTORE_PATH` environment variable must be set in any environment beyond local testing.
 - Old objects are never re-wrapped after rotation; if the old KEK is later confirmed compromised, those objects remain at risk until manually re-encrypted.
 - `StorageClient` thread safety is now defined by [ADR-0006](0006-concurrency-contract.md): `kek_ring_` and `active_kek_id_` are protected by a `std::shared_mutex`. Concurrent conflicting mutations on the same object ID remain intentionally unordered.

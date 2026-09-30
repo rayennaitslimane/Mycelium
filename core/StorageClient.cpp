@@ -27,10 +27,10 @@ namespace {
 // Constants
 // =========================
 
-const std::string kDefaultKekFilePath = "/tmp/pqdos_kek.json";
+const std::string kDefaultKekFilePath = "/tmp/myc_kek.json";
 
 std::string parseKekFilePath() {
-    const char* env = std::getenv("PQDOS_KEYSTORE_PATH");
+    const char* env = std::getenv("MYC_KEYSTORE_PATH");
     if (env) {
         return env;
     }

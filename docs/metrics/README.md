@@ -35,7 +35,7 @@ The benchmark requires a running integration cluster (PostgreSQL + storage
 nodes), the same as the integration tests:
 
 ```bash
-cd pqdos-dev
+cd myc-dev
 ./scripts/setup-integration.sh
 ./build/Release/benchmark        # writes docs/metrics/benchmark_results.csv
 ./scripts/teardown-integration.sh
@@ -55,7 +55,7 @@ above cannot capture (it is single-threaded and never calls `list()`). The
 and needs only PostgreSQL:
 
 ```bash
-cd pqdos-dev
+cd myc-dev
 ./scripts/run-metadata-benchmarks.sh   # writes metadata_list_sweep.csv + metadata_throughput.csv
 ```
 
@@ -74,7 +74,7 @@ Mode and ranges are configurable via `META_BENCH_MODE` (`list`, `throughput`,
 ## Running the notebooks
 
 ```bash
-cd pqdos-dev/docs/metrics
+cd myc-dev/docs/metrics
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 jupyter notebook        # open 01_performance.ipynb / 02_reliability.ipynb

@@ -14,7 +14,7 @@ echo "Starting postgres-test..."
 docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d postgres-test
 
 echo "Waiting for postgres to be healthy..."
-until docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test pg_isready -U test_user -d pqdos_test > /dev/null 2>&1; do
+until docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test pg_isready -U test_user -d myc_test > /dev/null 2>&1; do
   sleep 1
 done
 echo "Postgres is ready."
@@ -22,7 +22,7 @@ echo "Postgres is ready."
 echo "Registering storage nodes in database..."
 
 docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
-  psql -U test_user -d pqdos_test -c "
+  psql -U test_user -d myc_test -c "
     CREATE TABLE IF NOT EXISTS nodes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       address TEXT NOT NULL UNIQUE,
@@ -32,7 +32,7 @@ docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
 
 for port in $(seq "$START_PORT" "$END_PORT"); do
   docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
-    psql -U test_user -d pqdos_test -c \
+    psql -U test_user -d myc_test -c \
     "INSERT INTO nodes (address) VALUES ('localhost:$port') ON CONFLICT DO NOTHING;"
 done
 
@@ -57,7 +57,7 @@ if ! pgrep -f "storage_client 0.0.0.0 8080" > /dev/null; then
   "$PROJECT_DIR/build/Release/storage_client" \
     0.0.0.0 \
     8080 \
-    "host=localhost port=5433 dbname=pqdos_test user=test_user password=test_password" &
+    "host=localhost port=5433 dbname=myc_test user=test_user password=test_password" &
 fi
 
 echo "Waiting for storage client to be ready..."

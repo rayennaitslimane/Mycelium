@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-This directory contains the Architecture Decision Records (ADRs) for pqdos.
+This directory contains the Architecture Decision Records (ADRs) for myc.
 Each ADR documents a significant design choice: its context, the decision made, and its consequences including known limitations.
 
 ## Index

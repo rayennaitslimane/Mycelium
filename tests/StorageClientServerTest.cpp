@@ -33,7 +33,7 @@ std::string testConnectionString() {
 
     return "host=localhost "
            "port=5433 "
-           "dbname=pqdos_test "
+           "dbname=myc_test "
            "user=test_user "
            "password=test_password";
 }

@@ -24,7 +24,7 @@ std::string testConnectionString() {
     // Matches docker-compose.yml
     return "host=localhost "
            "port=5433 "
-           "dbname=pqdos_test "
+           "dbname=myc_test "
            "user=test_user "
            "password=test_password";
 }

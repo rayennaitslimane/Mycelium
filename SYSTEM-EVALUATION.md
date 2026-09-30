@@ -1,4 +1,4 @@
-# PQDOS System Evaluation
+# Mycelium System Evaluation
 
 ## How this was measured
 
@@ -17,7 +17,7 @@ claim, I've tried to point at the chart or the ADR that backs it.
 
 ## The short version
 
-PQDOS does what it set out to do. Objects encrypt, split, store, survive node loss, and come back
+Mycelium does what it set out to do. Objects encrypt, split, store, survive node loss, and come back
 intact, and the post-quantum machinery costs almost nothing to run. The part that used to be a
 guess, where the rest of the time went, is now measured end to end.
 
@@ -80,7 +80,7 @@ ones are punished. A 1 KB object at `2+1` carries the full per-shard framing, a 
 and a msgpack envelope on every fragment, negligible for a megabyte and ruinous for a kilobyte.
 Higher `k` amortizes this well: at equivalent durability, an `8+2` profile is far leaner than
 `2+2`. The same fixed-cost effect shows up in latency, where the metadata phase is a visible
-fraction of a tiny operation but vanishes on large ones. The takeaway is that PQDOS rewards
+fraction of a tiny operation but vanishes on large ones. The takeaway is that Mycelium rewards
 batching small objects and choosing wider stripes.
 
 ## Repair is the wild card, but it's no longer a black box
@@ -125,7 +125,7 @@ storage hygiene and key management rather than raw latency:
    shards on nodes with no reclaim path. They cause no correctness problem, but they leak storage;
    a GC sweep needs to exist.
 4. **Harden key management before this is more than a POC.** The default keystore still sits in
-   world-accessible `/tmp/pqdos_kek.json` and is a single point of failure, and `rotate()` mints a
+   world-accessible `/tmp/myc_kek.json` and is a single point of failure, and `rotate()` mints a
    new KEK but never re-wraps existing objects' DEKs (ADR-0001). Since crypto isn't a performance
    concern, a re-wrap sweep, a keystore backup, and a non-`/tmp` default all come essentially for
    free.
@@ -155,12 +155,12 @@ addressed. The findings below are ordered by severity, each with a simple, high-
 ### High
 
 - **KEK keystore default is world-readable and creation races.** The default path
-  `/tmp/pqdos_kek.json` in [core/StorageClient.cpp](core/StorageClient.cpp) is a predictable,
+  `/tmp/myc_kek.json` in [core/StorageClient.cpp](core/StorageClient.cpp) is a predictable,
   world-writable location holding the ML-KEM private keys. In `save_kek_file`
   ([core/Crypto.cpp](core/Crypto.cpp)) the file is created with `std::ofstream` under the process
   umask and only downgraded to `0600` afterward, leaving a window where the key file is
   world-readable; the write is also non-atomic, so a crash can leave a truncated keystore.
-  *Fix:* require `PQDOS_KEYSTORE_PATH` (fail closed if unset, drop the `/tmp` default), `umask(077)`
+  *Fix:* require `MYC_KEYSTORE_PATH` (fail closed if unset, drop the `/tmp` default), `umask(077)`
   or `open(..., O_WRONLY|O_CREAT|O_EXCL, 0600)` before writing, and write to a temp file +
   `fsync` + `rename` for atomicity.
 - **All traffic is plaintext HTTP.** Both servers use `httplib::Server` over cleartext HTTP/1.1, and
@@ -208,7 +208,7 @@ recording, not merely an implementation oversight.
 
 ## Closing thought
 
-PQDOS already delivers the hard parts: post-quantum confidentiality at rest and erasure durability
+Mycelium already delivers the hard parts: post-quantum confidentiality at rest and erasure durability
 that matches the math, both at negligible cryptographic cost. The previous evaluation's defining
 caveat, an unmeasured, serialized metadata layer, has been closed: every phase is now timed, the
 connection pool and JOIN relieve the database path, and the write path has shed its avoidable

@@ -1,4 +1,4 @@
-"""Shared helpers for analysing PQDOS benchmark metrics.
+"""Shared helpers for analysing Mycelium benchmark metrics.
 
 The benchmark harness (``cmd/BenchmarkMain.cpp``) writes a CSV described by
 ADR-0007 with the columns:

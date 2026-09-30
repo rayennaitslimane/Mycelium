@@ -5,7 +5,7 @@
 
 ## Context
 
-pqdos needs a controlled benchmarking framework to measure system performance under varying erasure parameters and failure scenarios. The goal is evaluation-grade metrics, not production observability. Measurements must capture real execution paths (crypto phase, transport phase, total latency) without duplicating orchestration logic or introducing external dependencies.
+myc needs a controlled benchmarking framework to measure system performance under varying erasure parameters and failure scenarios. The goal is evaluation-grade metrics, not production observability. Measurements must capture real execution paths (crypto phase, transport phase, total latency) without duplicating orchestration logic or introducing external dependencies.
 
 Key requirements:
 - Measure PUT, GET, and REPAIR latency with phase-level breakdown (crypto vs transport)

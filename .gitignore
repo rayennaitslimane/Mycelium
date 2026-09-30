@@ -3,6 +3,8 @@
 .venv/
 /build
 
+/docs/audits
+
 CMakeUserPresets.json
 
 # Python cache

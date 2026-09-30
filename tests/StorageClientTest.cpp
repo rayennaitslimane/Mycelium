@@ -25,7 +25,7 @@ std::string testConnectionString() {
 
     return "host=localhost "
            "port=5433 "
-           "dbname=pqdos_test "
+           "dbname=myc_test "
            "user=test_user "
            "password=test_password";
 }
@@ -71,10 +71,10 @@ protected:
         connStr_ = testConnectionString();
 
         // Use a temp keystore file per test
-        kek_path_ = "/tmp/pqdos_kek_" +
+        kek_path_ = "/tmp/myc_kek_" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
             ".json";
-        setenv("PQDOS_KEYSTORE_PATH", kek_path_.c_str(), 1);
+        setenv("MYC_KEYSTORE_PATH", kek_path_.c_str(), 1);
 
         clearDatabase();
 
@@ -92,7 +92,7 @@ protected:
         client_.reset();
         clearDatabase();
         std::filesystem::remove(kek_path_);
-        unsetenv("PQDOS_KEYSTORE_PATH");
+        unsetenv("MYC_KEYSTORE_PATH");
     }
 
     void clearDatabase() {
@@ -445,13 +445,13 @@ TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
     ASSERT_FALSE(write_fail.load());
 
     // Fresh client for verification (new DB connection)
-    std::string verify_kek = "/tmp/pqdos_stress_verify_" +
+    std::string verify_kek = "/tmp/myc_stress_verify_" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
         ".json";
-    setenv("PQDOS_KEYSTORE_PATH", verify_kek.c_str(), 1);
+    setenv("MYC_KEYSTORE_PATH", verify_kek.c_str(), 1);
     StorageClient verify_client(connStr_);
     verify_client.init();
-    setenv("PQDOS_KEYSTORE_PATH", kek_path_.c_str(), 1);
+    setenv("MYC_KEYSTORE_PATH", kek_path_.c_str(), 1);
 
     // list() must return all 20 objects
     const auto items = verify_client.list();

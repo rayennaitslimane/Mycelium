@@ -241,7 +241,7 @@ void run_throughput(const std::string& conn_str) {
 int main() {
     const std::string conn_str = env_or(
         "BENCHMARK_METADATA_CONN",
-        "host=localhost port=5433 dbname=pqdos_test user=test_user password=test_password"
+        "host=localhost port=5433 dbname=myc_test user=test_user password=test_password"
     );
 
     const std::string mode = env_or("META_BENCH_MODE", "all");

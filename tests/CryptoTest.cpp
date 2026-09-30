@@ -493,7 +493,7 @@ TEST(CryptoTest, DecryptSucceedsWithOutOfOrderShards) {
 
 TEST(CryptoTest, SaveAndLoadKekFileRoundTrip) {
     namespace fs = std::filesystem;
-    const std::string path = "/tmp/pqdos_kek_roundtrip.json";
+    const std::string path = "/tmp/myc_kek_roundtrip.json";
 
     // Cleanup
     fs::remove(path);
@@ -527,7 +527,7 @@ TEST(CryptoTest, SaveAndLoadKekFileRoundTrip) {
 
 TEST(CryptoTest, SaveKekFileSetsPermissions0600) {
     namespace fs = std::filesystem;
-    const std::string path = "/tmp/pqdos_kek_perms.json";
+    const std::string path = "/tmp/myc_kek_perms.json";
 
     fs::remove(path);
 
@@ -544,7 +544,7 @@ TEST(CryptoTest, SaveKekFileSetsPermissions0600) {
 }
 
 TEST(CryptoTest, LoadKekFileThrowsOnCorruptJson) {
-    const std::string path = "/tmp/pqdos_kek_corrupt.json";
+    const std::string path = "/tmp/myc_kek_corrupt.json";
 
     std::ofstream f(path);
     f << "not valid json {{{{";
@@ -556,12 +556,12 @@ TEST(CryptoTest, LoadKekFileThrowsOnCorruptJson) {
 }
 
 TEST(CryptoTest, LoadKekFileThrowsOnMissingFile) {
-    EXPECT_THROW(load_kek_file("/tmp/pqdos_nonexistent_kek.json"), std::runtime_error);
+    EXPECT_THROW(load_kek_file("/tmp/myc_nonexistent_kek.json"), std::runtime_error);
 }
 
 TEST(CryptoTest, LoadedKeyCanDecryptDekFromOriginal) {
     namespace fs = std::filesystem;
-    const std::string path = "/tmp/pqdos_kek_decrypt.json";
+    const std::string path = "/tmp/myc_kek_decrypt.json";
 
     fs::remove(path);
 

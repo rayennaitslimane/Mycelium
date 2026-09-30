@@ -26,12 +26,12 @@ else
 fi
 
 # Single confirmation prompt
-read -r -p "Reset /tmp/pqdos_kek.json? (y/N): " answer
+read -r -p "Reset /tmp/myc_kek.json? (y/N): " answer
 if [[ "$answer" =~ ^[Yy]$ ]]; then
-  echo "Resetting /tmp/pqdos_kek.json..."
-  rm -f /tmp/pqdos_kek.json
+  echo "Resetting /tmp/myc_kek.json..."
+  rm -f /tmp/myc_kek.json
 else
-  echo "Keeping existing /tmp/pqdos_kek.json."
+  echo "Keeping existing /tmp/myc_kek.json."
 fi
 
 echo "Teardown complete."

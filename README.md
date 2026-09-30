@@ -1,9 +1,9 @@
 
-# Post Quantum Distributed Object Store (PQDOS)
+# Post Quantum Distributed Object Store (Mycelium)
 
-PQDOS is a C++20 distributed object store designed for a zero-trust model, using ML-KEM-768 for post-quantum key wrapping, AES-256-GCM for data encryption, and ISA-L Reed-Solomon erasure coding for fault tolerance. It stores encrypted shards and metadata in separate backends and exposes a simple HTTP API for reliable object storage and retrieval.
+Mycelium is a C++20 distributed object store designed for a zero-trust model, using ML-KEM-768 for post-quantum key wrapping, AES-256-GCM for data encryption, and ISA-L Reed-Solomon erasure coding for fault tolerance. It stores encrypted shards and metadata in separate backends and exposes a simple HTTP API for reliable object storage and retrieval.
 
-Today’s storage encryption still depends on RSA and elliptic-curve cryptography which a capable quantum computer could eventually break. PQDOS explores an alternative aspiring to distributed RAIN (Redundant Array of Independant Nodes) principles and integrating a layer of post-quantum security.
+Today’s storage encryption still depends on RSA and elliptic-curve cryptography which a capable quantum computer could eventually break. Mycelium explores an alternative aspiring to distributed RAIN (Redundant Array of Independant Nodes) principles and integrating a layer of post-quantum security.
 
 
 ## I. Architecture Overview
@@ -69,7 +69,7 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 ### Unit Tests
 
 ```bash
-./build/Release/pqdos_unit_tests
+./build/Release/myc_unit_tests
 ```
 
 ### Integration Tests
@@ -81,7 +81,7 @@ Integration tests require PostgreSQL and storage nodes running locally.
 ./scripts/setup-integration.sh
 
 # Run tests
-./build/Release/pqdos_integration_tests
+./build/Release/myc_integration_tests
 
 # Stop all services
 ./scripts/teardown-integration.sh

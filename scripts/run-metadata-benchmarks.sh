@@ -24,7 +24,7 @@ docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d postgres-test
 
 echo "Waiting for postgres to be healthy..."
 until docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
-    pg_isready -U test_user -d pqdos_test > /dev/null 2>&1; do
+    pg_isready -U test_user -d myc_test > /dev/null 2>&1; do
   sleep 1
 done
 echo "Postgres is ready."
