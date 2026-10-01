@@ -49,6 +49,8 @@ struct ObjectMetadata {
     Bytes encrypted_dek;
     std::string kek_id;
     int version = 0;
+
+    MSGPACK_DEFINE(id, size, checksum, erasure, shard_locations, encrypted_dek, kek_id, version);
 };
 
 struct PlainShard {

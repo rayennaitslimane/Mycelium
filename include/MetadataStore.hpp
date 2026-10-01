@@ -1,84 +1,78 @@
 #pragma once
 
+#include "IMetadataStore.hpp"
+#include "MetadataCommand.hpp"
 #include "Models.hpp"
 
-#include <pqxx/pqxx>
+#include <lmdb.h>
 
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <string>
 #include <vector>
 
-class MetadataStore {
+class LmdbTxn;
+
+class MetadataStore : public IMetadataStore {
 public:
-    explicit MetadataStore(const std::string& conn_str, std::size_t pool_size = 4);
+    explicit MetadataStore(const std::string& dir);
 
-    void put(const ObjectMetadata& metadata);
+    ~MetadataStore() override;
 
-    bool conditional_put(const ObjectMetadata& metadata, int expected_version);
+    MetadataStore(const MetadataStore&) = delete;
+    MetadataStore& operator=(const MetadataStore&) = delete;
 
-    std::optional<ObjectMetadata> get(const std::string& id);
+    MetadataStore(MetadataStore&&) = delete;
+    MetadataStore& operator=(MetadataStore&&) = delete;
 
-    bool remove(const std::string& id);
+    // Applies a replicated log entry; entries at or below last_applied() are skipped.
+    MetadataResult apply(const MetadataCommand& cmd, std::uint64_t log_idx);
 
-    std::vector<ObjectMetadata> list();
+    std::uint64_t last_applied();
 
-    void register_node(const std::string& address);
+    // Read txn pinning the current state; may be used from another thread (MDB_NOTLS).
+    std::unique_ptr<LmdbTxn> begin_snapshot_read();
 
-    bool unregister_node(const std::string& address);
+    // Writes every DBI visible in txn as msgpack files dir/chunk_<n>; returns the chunk count.
+    std::size_t write_snapshot_chunks(MDB_txn* txn, const std::string& dir);
 
-    std::vector<std::string> list_nodes();
+    // Replaces all state with the chunks in dir and sets last_applied, in one write txn.
+    void restore_snapshot(const std::string& dir, std::size_t chunks, std::uint64_t log_idx);
+
+    void put(const ObjectMetadata& metadata) override;
+
+    bool conditional_put(const ObjectMetadata& metadata, int expected_version) override;
+
+    std::optional<ObjectMetadata> get(const std::string& id) override;
+
+    bool remove(const std::string& id) override;
+
+    std::vector<ObjectMetadata> list() override;
+
+    void register_node(const std::string& address) override;
+
+    bool unregister_node(const std::string& address) override;
+
+    std::vector<std::string> list_nodes() override;
 
 private:
-    // Bounded pool of libpqxx connections. A pqxx::connection is not thread-safe
-    // even for read-only work (ADR-0006), so each connection is checked out to
-    // exactly one thread at a time via the free list below. Different
-    // connections execute transactions concurrently, replacing the previous
-    // single-connection + global-mutex serialization.
-    std::vector<std::unique_ptr<pqxx::connection>> connections_;
-    std::queue<pqxx::connection*> available_;
-    std::mutex pool_mu_;
-    std::condition_variable pool_cv_;
+    MDB_env* env_ = nullptr;
+    MDB_dbi objects_{};
+    MDB_dbi nodes_{};
+    MDB_dbi meta_{};
+    MDB_dbi dedup_{};
 
-    // RAII checkout handle: pops a connection on construction (blocking until one
-    // is free) and returns it to the free list on destruction.
-    class PooledConnection {
-    public:
-        PooledConnection(MetadataStore& store, pqxx::connection* conn)
-            : store_(store), conn_(conn) {}
+    MetadataResult commit(const MetadataCommand& cmd, std::optional<std::uint64_t> log_idx);
 
-        ~PooledConnection() { store_.release(conn_); }
+    MetadataResult apply_in_txn(MDB_txn* txn, const MetadataCommand& cmd);
 
-        PooledConnection(const PooledConnection&) = delete;
-        PooledConnection& operator=(const PooledConnection&) = delete;
+    std::optional<ObjectMetadata> get_in_txn(MDB_txn* txn, const std::string& id);
 
-        pqxx::connection& operator*() const { return *conn_; }
+    void put_object(MDB_txn* txn, const ObjectMetadata& metadata);
 
-    private:
-        MetadataStore& store_;
-        pqxx::connection* conn_;
-    };
+    std::uint64_t read_u64(MDB_txn* txn, const std::string& key);
 
-    PooledConnection acquire();
-
-    void release(pqxx::connection* conn);
-
-    static void init_schema(pqxx::connection& conn);
-
-    static void prepare_statements(pqxx::connection& conn);
-
-    static ObjectMetadata row_to_object_metadata(const pqxx::row_ref& row);
-
-    static std::vector<std::string> get_shard_locations(
-        pqxx::transaction_base& tx,
-        const std::string& object_id
-    );
-
-    static std::int64_t checked_size_to_i64(std::size_t value);
-
-    static void validate_metadata(const ObjectMetadata& metadata);
+    void write_u64(MDB_txn* txn, const std::string& key, std::uint64_t value);
 };

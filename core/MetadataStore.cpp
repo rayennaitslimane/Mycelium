@@ -1,560 +1,457 @@
-#include "Models.hpp"
 #include "MetadataStore.hpp"
 
+#include "LmdbTxn.hpp"
+
+#include <msgpack.hpp>
+
 #include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <limits>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
-MetadataStore::MetadataStore(const std::string& conn_str, std::size_t pool_size) {
-    pool_size = std::max<std::size_t>(1, pool_size);
-    connections_.reserve(pool_size);
+namespace {
 
-    for (std::size_t i = 0; i < pool_size; ++i) {
-        auto conn = std::make_unique<pqxx::connection>(conn_str);
+constexpr const char* kLastApplied = "last_applied";
+constexpr const char* kNextNodeSeq = "next_node_seq";
 
-        // The schema is idempotent (CREATE IF NOT EXISTS); applying it once is
-        // sufficient. Prepared statements are per-connection, so every pooled
-        // connection must prepare its own.
-        if (i == 0) {
-            init_schema(*conn);
+// Dedup entries older than kDedupWindow log entries are pruned every kDedupPruneEvery entries.
+constexpr std::uint64_t kDedupWindow = 100000;
+constexpr std::uint64_t kDedupPruneEvery = 1000;
+
+constexpr std::size_t kSnapshotChunkBytes = 1024 * 1024;
+
+// (dbi index, key, value)
+using SnapshotRecord = std::tuple<std::uint8_t, std::string, std::string>;
+
+// (log index, result.ok)
+using DedupEntry = std::tuple<std::uint64_t, bool>;
+
+using Txn = LmdbTxn;
+
+void check_lmdb(int rc, const char* operation) {
+    check_lmdb_rc(rc, operation);
+}
+
+MDB_val as_val(const std::string& s) {
+    return MDB_val{s.size(), const_cast<char*>(s.data())};
+}
+
+ObjectMetadata decode_object(const MDB_val& value) {
+    msgpack::object_handle handle =
+        msgpack::unpack(static_cast<const char*>(value.mv_data), value.mv_size);
+    ObjectMetadata metadata;
+    handle.get().convert(metadata);
+    return metadata;
+}
+
+std::uint64_t decode_u64(const MDB_val& value) {
+    if (value.mv_size != sizeof(std::uint64_t)) {
+        throw std::runtime_error("MetadataStore: corrupt u64 value");
+    }
+    std::uint64_t result = 0;
+    std::memcpy(&result, value.mv_data, sizeof(result));
+    return result;
+}
+
+std::string as_string(const MDB_val& value) {
+    return std::string(static_cast<const char*>(value.mv_data), value.mv_size);
+}
+
+void for_each_entry(
+    MDB_txn* txn,
+    MDB_dbi dbi,
+    const std::function<void(const MDB_val&, const MDB_val&)>& fn
+) {
+    MDB_cursor* cursor = nullptr;
+    check_lmdb(mdb_cursor_open(txn, dbi, &cursor), "mdb_cursor_open");
+    MDB_val key{};
+    MDB_val value{};
+    int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+    try {
+        while (rc == 0) {
+            fn(key, value);
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
         }
-        prepare_statements(*conn);
-
-        available_.push(conn.get());
-        connections_.push_back(std::move(conn));
+    } catch (...) {
+        mdb_cursor_close(cursor);
+        throw;
+    }
+    mdb_cursor_close(cursor);
+    if (rc != MDB_NOTFOUND) {
+        check_lmdb(rc, "mdb_cursor_get");
     }
 }
 
-MetadataStore::PooledConnection MetadataStore::acquire() {
-    std::unique_lock<std::mutex> lock(pool_mu_);
-    pool_cv_.wait(lock, [this] { return !available_.empty(); });
+}  // namespace
 
-    pqxx::connection* conn = available_.front();
-    available_.pop();
+MetadataStore::MetadataStore(const std::string& dir) {
+    std::filesystem::create_directories(dir);
 
-    return PooledConnection(*this, conn);
-}
+    check_lmdb(mdb_env_create(&env_), "mdb_env_create");
 
-void MetadataStore::release(pqxx::connection* conn) {
-    {
-        std::lock_guard<std::mutex> lock(pool_mu_);
-        available_.push(conn);
+    try {
+        check_lmdb(mdb_env_set_maxdbs(env_, 4), "mdb_env_set_maxdbs");
+        check_lmdb(mdb_env_set_mapsize(env_, 1UL * 1024 * 1024 * 1024), "mdb_env_set_mapsize");
+        check_lmdb(mdb_env_open(env_, dir.c_str(), MDB_NOTLS, 0664), "mdb_env_open");
+
+        Txn txn(env_, 0);
+        check_lmdb(mdb_dbi_open(txn, "objects", MDB_CREATE, &objects_), "mdb_dbi_open(objects)");
+        check_lmdb(mdb_dbi_open(txn, "nodes", MDB_CREATE, &nodes_), "mdb_dbi_open(nodes)");
+        check_lmdb(mdb_dbi_open(txn, "meta", MDB_CREATE, &meta_), "mdb_dbi_open(meta)");
+        check_lmdb(mdb_dbi_open(txn, "dedup", MDB_CREATE, &dedup_), "mdb_dbi_open(dedup)");
+        txn.commit();
+    } catch (...) {
+        mdb_env_close(env_);
+        env_ = nullptr;
+        throw;
     }
-    pool_cv_.notify_one();
 }
 
-void MetadataStore::init_schema(pqxx::connection& conn) {
-    pqxx::work tx{conn};
+MetadataStore::~MetadataStore() {
+    if (env_ != nullptr) {
+        mdb_env_close(env_);
+        env_ = nullptr;
+    }
+}
 
-    tx.exec(R"SQL(
-        CREATE TABLE IF NOT EXISTS object_metadata (
-            id UUID PRIMARY KEY,
-            size BIGINT NOT NULL CHECK (size >= 0),
-            checksum TEXT NOT NULL,
-            erasure_spec BYTEA NOT NULL,
-            encrypted_dek BYTEA NOT NULL,
-            kek_id TEXT NOT NULL,
-            version INTEGER NOT NULL DEFAULT 1
-        );
-    )SQL");
+MetadataResult MetadataStore::apply(const MetadataCommand& cmd, std::uint64_t log_idx) {
+    return commit(cmd, log_idx);
+}
 
-    tx.exec(R"SQL(
-        CREATE TABLE IF NOT EXISTS object_shard_locations (
-            object_id UUID NOT NULL REFERENCES object_metadata(id) ON DELETE CASCADE,
-            shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
-            location TEXT NOT NULL,
-            PRIMARY KEY (object_id, shard_index)
-        );
-    )SQL");
+std::uint64_t MetadataStore::last_applied() {
+    Txn txn(env_, MDB_RDONLY);
+    return read_u64(txn, kLastApplied);
+}
 
-    tx.exec(R"SQL(
-        CREATE INDEX IF NOT EXISTS idx_object_shard_locations_object_id
-        ON object_shard_locations(object_id);
-    )SQL");
+std::unique_ptr<LmdbTxn> MetadataStore::begin_snapshot_read() {
+    return std::make_unique<LmdbTxn>(env_, MDB_RDONLY);
+}
 
-    tx.exec(R"SQL(
-        CREATE TABLE IF NOT EXISTS nodes (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            address TEXT NOT NULL UNIQUE,
-            registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-    )SQL");
+std::size_t MetadataStore::write_snapshot_chunks(MDB_txn* txn, const std::string& dir) {
+    const MDB_dbi dbis[] = {objects_, nodes_, meta_, dedup_};
+    std::vector<SnapshotRecord> records;
+    std::size_t bytes = 0;
+    std::size_t chunks = 0;
 
-    tx.commit();
+    auto flush = [&] {
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, records);
+        const auto path = std::filesystem::path(dir) / ("chunk_" + std::to_string(chunks++));
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(sbuf.data(), static_cast<std::streamsize>(sbuf.size()));
+        if (!out) {
+            throw std::runtime_error("MetadataStore: failed to write " + path.string());
+        }
+        records.clear();
+        bytes = 0;
+    };
+
+    for (std::uint8_t i = 0; i < std::size(dbis); ++i) {
+        for_each_entry(txn, dbis[i], [&](const MDB_val& key, const MDB_val& value) {
+            records.emplace_back(i, as_string(key), as_string(value));
+            bytes += key.mv_size + value.mv_size;
+            if (bytes >= kSnapshotChunkBytes) {
+                flush();
+            }
+        });
+    }
+    if (!records.empty() || chunks == 0) {
+        flush();
+    }
+    return chunks;
+}
+
+void MetadataStore::restore_snapshot(
+    const std::string& dir,
+    std::size_t chunks,
+    std::uint64_t log_idx
+) {
+    const MDB_dbi dbis[] = {objects_, nodes_, meta_, dedup_};
+    Txn txn(env_, 0);
+    for (const MDB_dbi dbi : dbis) {
+        check_lmdb(mdb_drop(txn, dbi, 0), "mdb_drop");
+    }
+
+    for (std::size_t n = 0; n < chunks; ++n) {
+        const auto path = std::filesystem::path(dir) / ("chunk_" + std::to_string(n));
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("MetadataStore: missing snapshot chunk " + path.string());
+        }
+        const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        msgpack::object_handle handle = msgpack::unpack(data.data(), data.size());
+        std::vector<SnapshotRecord> records;
+        handle.get().convert(records);
+
+        for (auto& [dbi_index, key, value] : records) {
+            if (dbi_index >= std::size(dbis)) {
+                throw std::runtime_error("MetadataStore: corrupt snapshot chunk " + path.string());
+            }
+            MDB_val k = as_val(key);
+            MDB_val v = as_val(value);
+            check_lmdb(mdb_put(txn, dbis[dbi_index], &k, &v, 0), "mdb_put(snapshot)");
+        }
+    }
+
+    write_u64(txn, kLastApplied, log_idx);
+    txn.commit();
 }
 
 void MetadataStore::put(const ObjectMetadata& metadata) {
-    auto conn = acquire();
-    validate_metadata(metadata);
-
-    pqxx::work tx{*conn};
-
-    const std::int64_t object_size = checked_size_to_i64(metadata.size);
-    const Bytes erasure_bytes = metadata.erasure.serialize();
-
-    if (erasure_bytes.empty()) {
-        throw std::invalid_argument("ObjectMetadata.erasure serialized to an empty buffer");
-    }
-
-    pqxx::bytes erasure_blob;
-    erasure_blob.reserve(erasure_bytes.size());
-
-    for (const auto byte : erasure_bytes) {
-        erasure_blob.push_back(static_cast<std::byte>(byte));
-    }
-
-    pqxx::bytes encrypted_dek_blob;
-    encrypted_dek_blob.reserve(metadata.encrypted_dek.size());
-
-    for (const auto byte : metadata.encrypted_dek) {
-        encrypted_dek_blob.push_back(static_cast<std::byte>(byte));
-    }
-
-    tx.exec(
-        pqxx::prepped{"put_object_metadata"},
-        pqxx::params{
-            metadata.id,
-            object_size,
-            metadata.checksum,
-            erasure_blob,
-            encrypted_dek_blob,
-            metadata.kek_id
-        }
-    );
-
-    // Replace shard locations atomically.
-    tx.exec(
-        pqxx::prepped{"delete_object_shard_locations"},
-        pqxx::params{
-            metadata.id
-        }
-    );
-
-    for (std::size_t i = 0; i < metadata.shard_locations.size(); ++i) {
-        if (i > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-            throw std::overflow_error("Too many shard locations for INTEGER shard_index");
-        }
-
-        tx.exec(
-            pqxx::prepped{"insert_object_shard_location"},
-            pqxx::params{
-                metadata.id,
-                static_cast<std::int32_t>(i),
-                metadata.shard_locations[i]
-            }
-        );
-    }
-
-    tx.commit();
-}
-
-std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
-    auto conn = acquire();
-    pqxx::read_transaction tx{*conn};
-
-    pqxx::result metadata_rows = tx.exec(
-        pqxx::prepped{"get_object_metadata"},
-        pqxx::params{
-            id
-        }
-    );
-
-    if (metadata_rows.empty()) {
-        return std::nullopt;
-    }
-
-    ObjectMetadata metadata = row_to_object_metadata(metadata_rows[0]);
-    metadata.shard_locations = get_shard_locations(tx, id);
-
-    return metadata;
-}
-
-bool MetadataStore::remove(const std::string& id) {
-    auto conn = acquire();
-    pqxx::work tx{*conn};
-
-    pqxx::result result = tx.exec(
-        pqxx::prepped{"remove_object_metadata"},
-        pqxx::params{
-            id
-        }
-    );
-
-    const bool deleted = result.affected_rows() > 0;
-
-    tx.commit();
-
-    return deleted;
-}
-
-std::vector<ObjectMetadata> MetadataStore::list() {
-    auto conn = acquire();
-    pqxx::read_transaction tx{*conn};
-
-    pqxx::result rows = tx.exec(
-        pqxx::prepped{"list_object_metadata"},
-        pqxx::params{}
-    );
-
-    // The query LEFT JOINs object_shard_locations and is ordered by
-    // (id, shard_index), so each object's rows are contiguous and its shard
-    // locations arrive in index order. A new ObjectMetadata is started whenever
-    // the id changes; the location column is NULL for objects with no shards.
-    std::vector<ObjectMetadata> objects;
-
-    for (const auto& row : rows) {
-        const std::string id = row["id"].c_str();
-
-        if (objects.empty() || objects.back().id != id) {
-            objects.push_back(row_to_object_metadata(row));
-        }
-
-        if (!row["location"].is_null()) {
-            objects.back().shard_locations.push_back(row["location"].c_str());
-        }
-    }
-
-    return objects;
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::Put;
+    cmd.metadata = metadata;
+    validate_command(cmd);
+    commit(cmd, std::nullopt);
 }
 
 bool MetadataStore::conditional_put(const ObjectMetadata& metadata, int expected_version) {
-    auto conn = acquire();
-    validate_metadata(metadata);
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::ConditionalPut;
+    cmd.metadata = metadata;
+    cmd.expected_version = expected_version;
+    validate_command(cmd);
+    return commit(cmd, std::nullopt).ok;
+}
 
-    pqxx::work tx{*conn};
+std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
+    Txn txn(env_, MDB_RDONLY);
+    return get_in_txn(txn, id);
+}
 
-    const std::int64_t object_size = checked_size_to_i64(metadata.size);
-    const Bytes erasure_bytes = metadata.erasure.serialize();
+bool MetadataStore::remove(const std::string& id) {
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::Remove;
+    cmd.key = id;
+    validate_command(cmd);
+    return commit(cmd, std::nullopt).ok;
+}
 
-    pqxx::bytes erasure_blob;
-    erasure_blob.reserve(erasure_bytes.size());
-    for (const auto byte : erasure_bytes) {
-        erasure_blob.push_back(static_cast<std::byte>(byte));
-    }
+std::vector<ObjectMetadata> MetadataStore::list() {
+    Txn txn(env_, MDB_RDONLY);
+    MDB_cursor* cursor = nullptr;
+    check_lmdb(mdb_cursor_open(txn, objects_, &cursor), "mdb_cursor_open");
 
-    pqxx::bytes encrypted_dek_blob;
-    encrypted_dek_blob.reserve(metadata.encrypted_dek.size());
-    for (const auto byte : metadata.encrypted_dek) {
-        encrypted_dek_blob.push_back(static_cast<std::byte>(byte));
-    }
-
-    pqxx::result result = tx.exec(
-        pqxx::prepped{"conditional_put_object_metadata"},
-        pqxx::params{
-            metadata.id,
-            object_size,
-            metadata.checksum,
-            erasure_blob,
-            encrypted_dek_blob,
-            metadata.kek_id,
-            expected_version
+    std::vector<ObjectMetadata> result;
+    MDB_val key{};
+    MDB_val value{};
+    int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+    try {
+        while (rc == 0) {
+            result.push_back(decode_object(value));
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
         }
-    );
-
-    if (result.affected_rows() == 0) {
-        tx.commit();
-        return false;
+    } catch (...) {
+        mdb_cursor_close(cursor);
+        throw;
     }
+    mdb_cursor_close(cursor);
 
-    // Replace shard locations atomically.
-    tx.exec(
-        pqxx::prepped{"delete_object_shard_locations"},
-        pqxx::params{metadata.id}
-    );
-
-    for (std::size_t i = 0; i < metadata.shard_locations.size(); ++i) {
-        tx.exec(
-            pqxx::prepped{"insert_object_shard_location"},
-            pqxx::params{
-                metadata.id,
-                static_cast<std::int32_t>(i),
-                metadata.shard_locations[i]
-            }
-        );
+    if (rc != MDB_NOTFOUND) {
+        check_lmdb(rc, "mdb_cursor_get");
     }
-
-    tx.commit();
-    return true;
+    return result;
 }
 
 void MetadataStore::register_node(const std::string& address) {
-    auto conn = acquire();
-    pqxx::work tx{*conn};
-
-    tx.exec(
-        pqxx::prepped{"register_node"},
-        pqxx::params{address}
-    );
-
-    tx.commit();
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::RegisterNode;
+    cmd.key = address;
+    validate_command(cmd);
+    commit(cmd, std::nullopt);
 }
 
 bool MetadataStore::unregister_node(const std::string& address) {
-    auto conn = acquire();
-    pqxx::work tx{*conn};
-
-    pqxx::result result = tx.exec(
-        pqxx::prepped{"unregister_node"},
-        pqxx::params{address}
-    );
-
-    tx.commit();
-    return result.affected_rows() > 0;
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::UnregisterNode;
+    cmd.key = address;
+    validate_command(cmd);
+    return commit(cmd, std::nullopt).ok;
 }
 
 std::vector<std::string> MetadataStore::list_nodes() {
-    auto conn = acquire();
-    pqxx::read_transaction tx{*conn};
+    Txn txn(env_, MDB_RDONLY);
+    MDB_cursor* cursor = nullptr;
+    check_lmdb(mdb_cursor_open(txn, nodes_, &cursor), "mdb_cursor_open");
 
-    pqxx::result rows = tx.exec(
-        pqxx::prepped{"list_nodes"},
-        pqxx::params{}
-    );
+    std::vector<std::pair<std::uint64_t, std::string>> entries;
+    MDB_val key{};
+    MDB_val value{};
+    int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+    try {
+        while (rc == 0) {
+            entries.emplace_back(
+                decode_u64(value),
+                std::string(static_cast<const char*>(key.mv_data), key.mv_size)
+            );
+            rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+        }
+    } catch (...) {
+        mdb_cursor_close(cursor);
+        throw;
+    }
+    mdb_cursor_close(cursor);
 
-    std::vector<std::string> addresses;
-    addresses.reserve(rows.size());
-
-    for (const auto& row : rows) {
-        addresses.push_back(row["address"].c_str());
+    if (rc != MDB_NOTFOUND) {
+        check_lmdb(rc, "mdb_cursor_get");
     }
 
-    return addresses;
+    std::sort(entries.begin(), entries.end());
+    std::vector<std::string> result;
+    result.reserve(entries.size());
+    for (auto& entry : entries) {
+        result.push_back(std::move(entry.second));
+    }
+    return result;
 }
 
-void MetadataStore::prepare_statements(pqxx::connection& conn) {
-    conn.prepare(
-        "put_object_metadata",
-        R"SQL(
-            INSERT INTO object_metadata (
-                id,
-                size,
-                checksum,
-                erasure_spec,
-                encrypted_dek,
-                kek_id,
-                version
-            )
-            VALUES (
-                $1::uuid,
-                $2,
-                $3,
-                $4::bytea,
-                $5::bytea,
-                $6,
-                1
-            )
-            ON CONFLICT (id) DO UPDATE
-            SET
-                size = EXCLUDED.size,
-                checksum = EXCLUDED.checksum,
-                erasure_spec = EXCLUDED.erasure_spec,
-                encrypted_dek = EXCLUDED.encrypted_dek,
-                kek_id = EXCLUDED.kek_id,
-                version = object_metadata.version + 1
-            RETURNING version
-        )SQL"
-    );
-
-    conn.prepare(
-        "conditional_put_object_metadata",
-        R"SQL(
-            UPDATE object_metadata
-            SET
-                size = $2,
-                checksum = $3,
-                erasure_spec = $4::bytea,
-                encrypted_dek = $5::bytea,
-                kek_id = $6,
-                version = version + 1
-            WHERE id = $1::uuid AND version = $7
-        )SQL"
-    );
-
-    conn.prepare(
-        "delete_object_shard_locations",
-        R"SQL(
-            DELETE FROM object_shard_locations
-            WHERE object_id = $1::uuid
-        )SQL"
-    );
-
-    conn.prepare(
-        "insert_object_shard_location",
-        R"SQL(
-            INSERT INTO object_shard_locations (
-                object_id,
-                shard_index,
-                location
-            )
-            VALUES (
-                $1::uuid,
-                $2,
-                $3
-            )
-        )SQL"
-    );
-
-    conn.prepare(
-        "get_object_metadata",
-        R"SQL(
-            SELECT
-                id::text,
-                size,
-                checksum,
-                erasure_spec,
-                encrypted_dek,
-                kek_id,
-                version
-            FROM object_metadata
-            WHERE id = $1::uuid
-        )SQL"
-    );
-
-    conn.prepare(
-        "get_object_shard_locations",
-        R"SQL(
-            SELECT location
-            FROM object_shard_locations
-            WHERE object_id = $1::uuid
-            ORDER BY shard_index ASC
-        )SQL"
-    );
-
-    conn.prepare(
-        "remove_object_metadata",
-        R"SQL(
-            DELETE FROM object_metadata
-            WHERE id = $1::uuid
-        )SQL"
-    );
-
-    conn.prepare(
-        "list_object_metadata",
-        R"SQL(
-            SELECT
-                m.id::text AS id,
-                m.size,
-                m.checksum,
-                m.erasure_spec,
-                m.encrypted_dek,
-                m.kek_id,
-                m.version,
-                l.location AS location
-            FROM object_metadata m
-            LEFT JOIN object_shard_locations l
-                ON l.object_id = m.id
-            ORDER BY m.id ASC, l.shard_index ASC
-        )SQL"
-    );
-
-    conn.prepare(
-        "register_node",
-        R"SQL(
-            INSERT INTO nodes (address)
-            VALUES ($1)
-            ON CONFLICT (address) DO NOTHING
-        )SQL"
-    );
-
-    conn.prepare(
-        "unregister_node",
-        R"SQL(
-            DELETE FROM nodes
-            WHERE address = $1
-        )SQL"
-    );
-
-    conn.prepare(
-        "list_nodes",
-        R"SQL(
-            SELECT address
-            FROM nodes
-            ORDER BY registered_at ASC
-        )SQL"
-    );
-}
-
-ObjectMetadata MetadataStore::row_to_object_metadata(const pqxx::row_ref& row) {
-    ObjectMetadata metadata;
-
-    metadata.id = row["id"].c_str();
-
-    const std::int64_t db_size = row["size"].as<std::int64_t>();
-    if (db_size < 0) {
-        throw std::runtime_error("Database returned negative object size");
-    }
-
-    metadata.size = static_cast<std::size_t>(db_size);
-    metadata.checksum = row["checksum"].c_str();
-
-    const pqxx::bytes erasure_blob = row["erasure_spec"].as<pqxx::bytes>();
-
-    Bytes erasure_bytes;
-    erasure_bytes.reserve(erasure_blob.size());
-
-    for (const std::byte byte : erasure_blob) {
-        erasure_bytes.push_back(static_cast<std::uint8_t>(byte));
-    }
-
-    metadata.erasure = ErasureSpec::deserialize(erasure_bytes);
-
-    const pqxx::bytes encrypted_dek_blob = row["encrypted_dek"].as<pqxx::bytes>();
-
-    metadata.encrypted_dek.reserve(encrypted_dek_blob.size());
-    for (const std::byte byte : encrypted_dek_blob) {
-        metadata.encrypted_dek.push_back(static_cast<std::uint8_t>(byte));
-    }
-
-    metadata.kek_id = row["kek_id"].c_str();
-    metadata.version = row["version"].as<int>();
-
-    return metadata;
-}
-
-std::vector<std::string> MetadataStore::get_shard_locations(
-    pqxx::transaction_base& tx,
-    const std::string& object_id
+MetadataResult MetadataStore::commit(
+    const MetadataCommand& cmd,
+    std::optional<std::uint64_t> log_idx
 ) {
-    pqxx::result rows = tx.exec(
-        pqxx::prepped{"get_object_shard_locations"},
-        pqxx::params{
-            object_id
+    Txn txn(env_, 0);
+    const std::uint64_t last = read_u64(txn, kLastApplied);
+    if (log_idx.has_value() && *log_idx <= last) {
+        return MetadataResult{};
+    }
+    const std::uint64_t idx = log_idx.value_or(last + 1);
+
+    MetadataResult result;
+    MDB_val request_key = as_val(cmd.request_id);
+    MDB_val dedup_value{};
+    const int rc = cmd.request_id.empty()
+        ? MDB_NOTFOUND
+        : mdb_get(txn, dedup_, &request_key, &dedup_value);
+    if (rc == 0) {
+        DedupEntry entry;
+        msgpack::unpack(static_cast<const char*>(dedup_value.mv_data), dedup_value.mv_size)
+            .get().convert(entry);
+        result.ok = std::get<1>(entry);
+    } else {
+        if (rc != MDB_NOTFOUND) {
+            check_lmdb(rc, "mdb_get(dedup)");
         }
-    );
-
-    std::vector<std::string> locations;
-    locations.reserve(rows.size());
-
-    for (const auto& row : rows) {
-        locations.push_back(row["location"].c_str());
-    }
-
-    return locations;
-}
-
-std::int64_t MetadataStore::checked_size_to_i64(std::size_t value) {
-    if (value > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
-        throw std::overflow_error("ObjectMetadata.size exceeds PostgreSQL BIGINT range");
-    }
-
-    return static_cast<std::int64_t>(value);
-}
-
-void MetadataStore::validate_metadata(const ObjectMetadata& metadata) {
-    if (metadata.id.empty()) {
-        throw std::invalid_argument("ObjectMetadata.id must not be empty");
-    }
-
-    if (metadata.checksum.empty()) {
-        throw std::invalid_argument("ObjectMetadata.checksum must not be empty");
-    }
-
-    for (const auto& location : metadata.shard_locations) {
-        if (location.empty()) {
-            throw std::invalid_argument("ObjectMetadata.shard_locations must not contain empty locations");
+        result = apply_in_txn(txn, cmd);
+        if (!cmd.request_id.empty()) {
+            msgpack::sbuffer sbuf;
+            msgpack::pack(sbuf, DedupEntry{idx, result.ok});
+            MDB_val v{sbuf.size(), sbuf.data()};
+            check_lmdb(mdb_put(txn, dedup_, &request_key, &v, 0), "mdb_put(dedup)");
         }
     }
+
+    // Pruning depends only on idx, so every replica prunes identically.
+    if (idx % kDedupPruneEvery == 0 && idx > kDedupWindow) {
+        std::vector<std::string> expired;
+        for_each_entry(txn, dedup_, [&](const MDB_val& key, const MDB_val& value) {
+            DedupEntry entry;
+            msgpack::unpack(static_cast<const char*>(value.mv_data), value.mv_size)
+                .get().convert(entry);
+            if (std::get<0>(entry) + kDedupWindow < idx) {
+                expired.push_back(as_string(key));
+            }
+        });
+        for (const auto& key : expired) {
+            MDB_val k = as_val(key);
+            check_lmdb(mdb_del(txn, dedup_, &k, nullptr), "mdb_del(dedup)");
+        }
+    }
+
+    write_u64(txn, kLastApplied, idx);
+    txn.commit();
+    return result;
+}
+
+MetadataResult MetadataStore::apply_in_txn(MDB_txn* txn, const MetadataCommand& cmd) {
+    MetadataResult result;
+
+    switch (cmd.op) {
+    case MetadataOp::Put: {
+        const auto existing = get_in_txn(txn, cmd.metadata.id);
+        ObjectMetadata metadata = cmd.metadata;
+        metadata.version = existing.has_value() ? existing->version + 1 : 1;
+        put_object(txn, metadata);
+        result.ok = true;
+        break;
+    }
+    case MetadataOp::ConditionalPut: {
+        const auto existing = get_in_txn(txn, cmd.metadata.id);
+        if (existing.has_value() && existing->version == cmd.expected_version) {
+            ObjectMetadata metadata = cmd.metadata;
+            metadata.version = existing->version + 1;
+            put_object(txn, metadata);
+            result.ok = true;
+        }
+        break;
+    }
+    case MetadataOp::Remove:
+    case MetadataOp::UnregisterNode: {
+        MDB_val key = as_val(cmd.key);
+        const MDB_dbi dbi = cmd.op == MetadataOp::Remove ? objects_ : nodes_;
+        const int rc = mdb_del(txn, dbi, &key, nullptr);
+        if (rc != MDB_NOTFOUND) {
+            check_lmdb(rc, "mdb_del");
+            result.ok = true;
+        }
+        break;
+    }
+    case MetadataOp::RegisterNode: {
+        MDB_val key = as_val(cmd.key);
+        MDB_val value{};
+        const int rc = mdb_get(txn, nodes_, &key, &value);
+        if (rc == MDB_NOTFOUND) {
+            const std::uint64_t seq = read_u64(txn, kNextNodeSeq);
+            value = MDB_val{sizeof(seq), const_cast<std::uint64_t*>(&seq)};
+            check_lmdb(mdb_put(txn, nodes_, &key, &value, 0), "mdb_put(nodes)");
+            write_u64(txn, kNextNodeSeq, seq + 1);
+        } else {
+            check_lmdb(rc, "mdb_get(nodes)");
+        }
+        result.ok = true;
+        break;
+    }
+    }
+
+    return result;
+}
+
+std::optional<ObjectMetadata> MetadataStore::get_in_txn(MDB_txn* txn, const std::string& id) {
+    MDB_val key = as_val(id);
+    MDB_val value{};
+    const int rc = mdb_get(txn, objects_, &key, &value);
+    if (rc == MDB_NOTFOUND) {
+        return std::nullopt;
+    }
+    check_lmdb(rc, "mdb_get(objects)");
+    return decode_object(value);
+}
+
+void MetadataStore::put_object(MDB_txn* txn, const ObjectMetadata& metadata) {
+    msgpack::sbuffer sbuf;
+    msgpack::pack(sbuf, metadata);
+    MDB_val key = as_val(metadata.id);
+    MDB_val value{sbuf.size(), sbuf.data()};
+    check_lmdb(mdb_put(txn, objects_, &key, &value, 0), "mdb_put(objects)");
+}
+
+std::uint64_t MetadataStore::read_u64(MDB_txn* txn, const std::string& key) {
+    MDB_val k = as_val(key);
+    MDB_val value{};
+    const int rc = mdb_get(txn, meta_, &k, &value);
+    if (rc == MDB_NOTFOUND) {
+        return 0;
+    }
+    check_lmdb(rc, "mdb_get(meta)");
+    return decode_u64(value);
+}
+
+void MetadataStore::write_u64(MDB_txn* txn, const std::string& key, std::uint64_t value) {
+    MDB_val k = as_val(key);
+    MDB_val v{sizeof(value), &value};
+    check_lmdb(mdb_put(txn, meta_, &k, &v, 0), "mdb_put(meta)");
 }

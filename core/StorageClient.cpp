@@ -154,8 +154,8 @@ std::array<uint8_t, 32> recover_dek(
 // StorageClient
 // =========================
 
-StorageClient::StorageClient(const std::string& metadata_conn_str)
-    : metadata_store_(metadata_conn_str),
+StorageClient::StorageClient(std::shared_ptr<IMetadataStore> metadata_store)
+    : metadata_store_(std::move(metadata_store)),
       kek_file_path_(parseKekFilePath()) {
     if (std::filesystem::exists(kek_file_path_)) {
         auto data = load_kek_file(kek_file_path_);
@@ -184,7 +184,7 @@ StorageClient::StorageClient(const std::string& metadata_conn_str)
 StorageClient::~StorageClient() = default;
 
 void StorageClient::init() {
-    for (const auto& node_address : metadata_store_.list_nodes()) {
+    for (const auto& node_address : metadata_store_->list_nodes()) {
         auto& client = get_node_client(node_address);
 
         auto res = client.Get("/health");
@@ -228,7 +228,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     }
 
     // Validate eligible node count
-    const std::vector<std::string> eligible_nodes = metadata_store_.list_nodes();
+    const std::vector<std::string> eligible_nodes = metadata_store_->list_nodes();
     const std::size_t required_nodes =
         static_cast<std::size_t>(erasure_spec.data_shards) + erasure_spec.parity_shards;
 
@@ -316,7 +316,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
 
     {
         ScopedTimer metadata_timer(&metadata_ms);
-        metadata_store_.put(metadata);
+        metadata_store_->put(metadata);
     }
 
     // Record metrics
@@ -361,7 +361,7 @@ Bytes StorageClient::get(const std::string& object_id) {
     std::optional<ObjectMetadata> metadata_opt;
     {
         ScopedTimer metadata_timer(&metadata_ms);
-        metadata_opt = metadata_store_.get(object_id);
+        metadata_opt = metadata_store_->get(object_id);
     }
     if (!metadata_opt.has_value()) {
         throw std::runtime_error("StorageClient::get: object not found: " + object_id);
@@ -448,7 +448,7 @@ bool StorageClient::remove(const std::string& object_id) {
     }
 
     // 1) Load metadata
-    const auto metadata_opt = metadata_store_.get(object_id);
+    const auto metadata_opt = metadata_store_->get(object_id);
     if (!metadata_opt.has_value()) {
         return false;
     }
@@ -464,11 +464,11 @@ bool StorageClient::remove(const std::string& object_id) {
     remove_from_nodes(shard_location_map);
 
     // 4) Remove metadata
-    return metadata_store_.remove(object_id);
+    return metadata_store_->remove(object_id);
 }
 
 std::vector<ObjectMetadata> StorageClient::list() {
-    return metadata_store_.list();
+    return metadata_store_->list();
 }
 
 void StorageClient::rotate() {
@@ -497,7 +497,7 @@ ObjectHealth StorageClient::health(const std::string& object_id) {
         throw std::invalid_argument("StorageClient::health: object_id cannot be empty");
     }
 
-    const auto metadata_opt = metadata_store_.get(object_id);
+    const auto metadata_opt = metadata_store_->get(object_id);
     if (!metadata_opt.has_value()) {
         throw std::runtime_error("StorageClient::health: object not found: " + object_id);
     }
@@ -551,7 +551,7 @@ bool StorageClient::repair(const std::string& object_id) {
     std::optional<ObjectMetadata> metadata_opt;
     {
         ScopedTimer metadata_timer(&metadata_get_ms);
-        metadata_opt = metadata_store_.get(object_id);
+        metadata_opt = metadata_store_->get(object_id);
     }
     if (!metadata_opt.has_value()) {
         throw std::runtime_error("StorageClient::repair: object not found: " + object_id);
@@ -701,7 +701,7 @@ bool StorageClient::repair(const std::string& object_id) {
         Botan::secure_scrub_memory(dek.data(), dek.size());
 
         // 10) Place repaired shards on eligible nodes
-        const std::vector<std::string> eligible_nodes = metadata_store_.list_nodes();
+        const std::vector<std::string> eligible_nodes = metadata_store_->list_nodes();
         std::vector<std::string> healthy_nodes;
         healthy_nodes.reserve(eligible_nodes.size());
 
@@ -803,7 +803,7 @@ bool StorageClient::repair(const std::string& object_id) {
         bool committed = false;
         {
             ScopedTimer metadata_timer(&metadata_put_ms);
-            committed = metadata_store_.conditional_put(updated_metadata, expected_version);
+            committed = metadata_store_->conditional_put(updated_metadata, expected_version);
         }
         if (!committed) {
             return false; // version changed - concurrent mutation

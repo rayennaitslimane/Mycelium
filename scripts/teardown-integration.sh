@@ -10,9 +10,19 @@ pkill -f "$PROJECT_DIR/build/Release/storage_client" || true
 echo "Stopping storage nodes..."
 pkill -f "$PROJECT_DIR/build/Release/storage_node" || true
 
+echo "Stopping metadata servers..."
+pkill -f "$PROJECT_DIR/build/Release/metadata_server" || true
 
-echo "Stopping postgres-test..."
-docker compose -f "$PROJECT_DIR/docker-compose.yml" down
+METADATA_ROOT="${METADATA_ROOT:-/tmp/myc-meta}"
+
+# Single confirmation prompt
+read -r -p "Reset metadata in ${METADATA_ROOT}{1..3}? (y/N): " answer
+if [[ "$answer" =~ ^[Yy]$ ]]; then
+  echo "Resetting metadata..."
+  rm -rf "${METADATA_ROOT}1" "${METADATA_ROOT}2" "${METADATA_ROOT}3"
+else
+  echo "Keeping existing metadata."
+fi
 
 # Single confirmation prompt
 read -r -p "Reset storage node data? (y/N): " answer

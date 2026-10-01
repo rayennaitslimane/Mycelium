@@ -1,3 +1,4 @@
+#include "MetadataClient.hpp"
 #include "MetricsCollector.hpp"
 #include "ShardTransport.hpp"
 #include "StorageClient.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,7 +76,7 @@ BenchmarkConfig default_config() {
 // REPAIR can still reconstruct). Reuses the StorageClient transport layer rather
 // than duplicating orchestration logic. Returns the number of shards dropped.
 uint32_t inject_failures(
-    MetadataStore& metadata_store,
+    IMetadataStore& metadata_store,
     const std::string& object_id,
     uint32_t count
 ) {
@@ -113,20 +115,19 @@ uint32_t inject_failures(
 
 
 int main() {
-    const std::string metadata_conn_str = env_or(
-        "BENCHMARK_METADATA_CONN",
-        "host=localhost port=5433 dbname=myc_test user=test_user password=test_password"
-    );
+    const std::string metadata_endpoints = env_or(
+        "BENCHMARK_METADATA_ENDPOINTS", "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003");
 
     const std::string csv_path = env_or("BENCHMARK_CSV_PATH", "docs/metrics/benchmark_results.csv");
 
     MetricsCollector collector;
 
-    StorageClient client(metadata_conn_str);
+    StorageClient client(std::make_shared<MetadataClient>(
+        MetadataClient::parse_endpoints(metadata_endpoints)));
     client.set_collector(&collector);
     client.init();
 
-    MetadataStore metadata_store(metadata_conn_str); 
+    IMetadataStore& metadata_store = client.metadata_store();
     const std::vector<std::string> eligible_nodes = metadata_store.list_nodes();
 
     BenchmarkConfig cfg = default_config();

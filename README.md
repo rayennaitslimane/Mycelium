@@ -25,7 +25,8 @@ Mermaid diagram for runtime wiring and boundaries:
       │         ├── Node :9001 -> StorageNode -> LMDB1
       │         ├── Node :9002 -> StorageNode -> LMDB2
       │         └── Node :9003 -> StorageNode -> LMDB3
-      └── MetadataStore -> PostgreSQL
+      └── MetadataClient -> metadata_server x3 :7001-7003
+                              (NuRaft + LMDB, ADR-0008)
 ```
 
 Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
@@ -34,11 +35,12 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 |-----|----------|
 | [0001](docs/adr/0001-quantum-encryption.md) | ML-KEM-768 KEM-based KEK ring + AES-256-GCM per-object DEK with shard-index AAD |
 | [0002](docs/adr/0002-erasure-codec.md) | ISA-L Reed-Solomon erasure coding with per-object `k`/`m`/`shard_size` |
-| [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, PostgreSQL for object metadata |
+| [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, separate store for object metadata (amended by 0008) |
 | [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch with dynamic placement and thread-local per-node client reuse |
 | [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server with Base64 object payloads and JSON erasure parameters |
 | [0006](docs/adr/0006-concurrency-contract.md) | Concurrency contract: MetadataStore mutex, KEK ring shared_mutex, tolerated per-object races |
 | [0007](docs/adr/0007-metrics-collector.md) | Inline metrics instrumentation with ScopedTimer, CSV export, benchmark harness |
+| [0008](docs/adr/0008-raft-metadata.md) | LMDB metadata replicated with NuRaft, lease reads on the leader |
 
 
 ## II. Prerequisites
@@ -48,7 +50,6 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 - CMake >= 3.23
 - Conan >= 2.x
 - Git
-- Docker
 
 
 ## III. Building
@@ -72,9 +73,17 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 ./build/Release/myc_unit_tests
 ```
 
+### Raft Tests
+
+These tests cover in-process clusters plus crash-restart tests that spawn `metadata_server` processes. Requires setting up integration, *see below*.
+
+```bash
+./build/Release/myc_raft_tests
+```
+
 ### Integration Tests
 
-Integration tests require PostgreSQL and storage nodes running locally.
+Integration tests need a 3-node metadata cluster, the storage nodes and the storage client running locally. Metadata data lives in `/tmp/myc-meta{1..3}`.
 
 ```bash
 # Start all services
@@ -92,10 +101,11 @@ Services exposed on the host:
 | Service | Port |
 |---------|------|
 | Storage Client API | `localhost:8080` |
+| Metadata Servers (HTTP) | `localhost:7001`-`7003` |
+| Metadata Servers (Raft) | `localhost:7101`-`7103` |
 | Storage Node 1 | `localhost:9001` |
 | Storage Node 2 | `localhost:9002` |
 | Storage Node 3 | `localhost:9003` |
-| PostgreSQL | `localhost:5433` |
 
 ## V. Client API
 
@@ -200,7 +210,7 @@ Configurable via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BENCHMARK_METADATA_CONN` | localhost test DB | PostgreSQL connection string |
+| `BENCHMARK_METADATA_ENDPOINTS` | `127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003` | Metadata server HTTP endpoints |
 | `BENCHMARK_CSV_PATH` | `benchmark_results.csv` | Output CSV file path |
 
 CSV columns: `operation`, `k`, `m`, `shard_size`, `object_size`, `failed_nodes`, `total_nodes`, `crypto_ms`, `transport_ms`, `total_ms`, `success`, `storage_overhead`.

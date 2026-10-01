@@ -9,33 +9,18 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 NODE_COUNT="${NODE_COUNT:-12}"
 START_PORT=9001
 END_PORT=$((START_PORT + NODE_COUNT - 1))
-
-echo "Starting postgres-test..."
-docker compose -f "$PROJECT_DIR/docker-compose.yml" up -d postgres-test
-
-echo "Waiting for postgres to be healthy..."
-until docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test pg_isready -U test_user -d myc_test > /dev/null 2>&1; do
-  sleep 1
+METADATA_ROOT="${METADATA_ROOT:-/tmp/myc-meta}"
+METADATA_NODES=3
+METADATA_ENDPOINTS=""
+for i in $(seq 1 "$METADATA_NODES"); do
+  METADATA_ENDPOINTS="${METADATA_ENDPOINTS:+$METADATA_ENDPOINTS,}127.0.0.1:$((7000 + i))"
 done
-echo "Postgres is ready."
 
-echo "Registering storage nodes in database..."
-
-docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
-  psql -U test_user -d myc_test -c "
-    CREATE TABLE IF NOT EXISTS nodes (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      address TEXT NOT NULL UNIQUE,
-      registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  "
-
+# Nodes are registered by storage_client on startup (order defines placement).
+REGISTER_NODES=""
 for port in $(seq "$START_PORT" "$END_PORT"); do
-  docker compose -f "$PROJECT_DIR/docker-compose.yml" exec -T postgres-test \
-    psql -U test_user -d myc_test -c \
-    "INSERT INTO nodes (address) VALUES ('localhost:$port') ON CONFLICT DO NOTHING;"
+  REGISTER_NODES="${REGISTER_NODES:+$REGISTER_NODES,}localhost:$port"
 done
-
 
 echo "Starting storage nodes..."
 
@@ -51,13 +36,45 @@ done
 
 sleep 1
 
+echo "Starting metadata servers..."
+
+# HTTP on 7001-7003, raft on 7101-7103; node 1 bootstraps, the others join.
+for i in $(seq 1 "$METADATA_NODES"); do
+  if ! pgrep -f "metadata_server $i " > /dev/null; then
+    "$PROJECT_DIR/build/Release/metadata_server" "$i" \
+      "127.0.0.1:$((7100 + i))" \
+      "127.0.0.1:$((7000 + i))" \
+      "$METADATA_ROOT$i" &
+  fi
+done
+
+echo "Waiting for a metadata leader..."
+leader_ready=false
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:7001/status | grep -qv '"leader_id":-1'; then
+    leader_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$leader_ready" != true ]]; then
+  echo "ERROR: metadata cluster did not elect a leader in time."
+  exit 1
+fi
+
+for i in $(seq 2 "$METADATA_NODES"); do
+  curl -sfL -X POST http://127.0.0.1:7001/admin/servers \
+    -d "{\"id\":$i,\"raft_endpoint\":\"127.0.0.1:$((7100 + i))\",\"http_endpoint\":\"127.0.0.1:$((7000 + i))\"}" \
+    > /dev/null
+done
+
 echo "Starting storage client..."
 
 if ! pgrep -f "storage_client 0.0.0.0 8080" > /dev/null; then
-  "$PROJECT_DIR/build/Release/storage_client" \
+  MYC_REGISTER_NODES="$REGISTER_NODES" "$PROJECT_DIR/build/Release/storage_client" \
     0.0.0.0 \
     8080 \
-    "host=localhost port=5433 dbname=myc_test user=test_user password=test_password" &
+    "$METADATA_ENDPOINTS" &
 fi
 
 echo "Waiting for storage client to be ready..."

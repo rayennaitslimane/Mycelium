@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
-#include <pqxx/pqxx>
 
+#include "MetadataStore.hpp"
 #include "StorageClient.hpp"
 
 #include <algorithm>
@@ -17,18 +17,6 @@
 #include <vector>
 
 namespace {
-
-std::string testConnectionString() {
-    if (const char* env = std::getenv("METADATASTORE_TEST_CONN")) {
-        return std::string{env};
-    }
-
-    return "host=localhost "
-           "port=5433 "
-           "dbname=myc_test "
-           "user=test_user "
-           "password=test_password";
-}
 
 Bytes ToBytes(const std::string& s) {
     return Bytes(s.begin(), s.end());
@@ -68,17 +56,16 @@ ErasureSpec TestErasureSpec() {
 class StorageClientTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        connStr_ = testConnectionString();
-
-        // Use a temp keystore file per test
-        kek_path_ = "/tmp/myc_kek_" +
-            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-            ".json";
+        // Use a temp keystore file and metadata dir per test
+        const std::string suffix =
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        kek_path_ = "/tmp/myc_kek_" + suffix + ".json";
         setenv("MYC_KEYSTORE_PATH", kek_path_.c_str(), 1);
 
-        clearDatabase();
+        metadata_dir_ = std::filesystem::temp_directory_path() / ("myc_metadata_" + suffix);
+        store_ = std::make_shared<MetadataStore>(metadata_dir_.string());
 
-        client_ = std::make_unique<StorageClient>(connStr_);
+        client_ = std::make_unique<StorageClient>(store_);
 
         // Register test nodes
         client_->metadata_store().register_node("localhost:9001");
@@ -90,30 +77,18 @@ protected:
 
     void TearDown() override {
         client_.reset();
-        clearDatabase();
+        store_.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(metadata_dir_, ec);
         std::filesystem::remove(kek_path_);
         unsetenv("MYC_KEYSTORE_PATH");
     }
 
-    void clearDatabase() {
-        pqxx::connection conn{connStr_};
-        pqxx::work tx{conn};
-
-        tx.exec(R"SQL(
-            TRUNCATE TABLE
-                object_shard_locations,
-                object_metadata,
-                nodes
-            RESTART IDENTITY
-            CASCADE
-        )SQL");
-
-        tx.commit();
-    }
-
     StorageClient& client() { return *client_; }
 
-    std::string connStr_;
+    // LMDB forbids opening one env twice per process, so all clients share it.
+    std::shared_ptr<MetadataStore> store_;
+    std::filesystem::path metadata_dir_;
     std::string kek_path_;
     std::unique_ptr<StorageClient> client_;
 };
@@ -198,7 +173,7 @@ TEST_F(StorageClientTest, RotationTest) {
 
     // Destroy and recreate client (simulates restart, loads keyring from file)
     client_.reset();
-    client_ = std::make_unique<StorageClient>(connStr_);
+    client_ = std::make_unique<StorageClient>(store_);
     client_->init();
 
     // Both objects must be readable
@@ -224,7 +199,7 @@ TEST_F(StorageClientTest, RapidConsecutiveRotationsPreserveReadability) {
 
     // Restart client and verify all generations remain readable.
     client_.reset();
-    client_ = std::make_unique<StorageClient>(connStr_);
+    client_ = std::make_unique<StorageClient>(store_);
     client_->init();
 
     EXPECT_EQ(ToString(client().get(id1)), payload1);
@@ -240,12 +215,11 @@ TEST_F(StorageClientTest, RapidConsecutiveRotationsPreserveReadability) {
 // file. Must be called from the main (test) thread because setenv is not
 // thread-safe.
 struct MultiClientEnv {
-    std::string connStr;
     std::vector<std::unique_ptr<StorageClient>> clients;
 
-    MultiClientEnv(const std::string& conn, int count) : connStr(conn) {
+    MultiClientEnv(const std::shared_ptr<IMetadataStore>& store, int count) {
         for (int i = 0; i < count; ++i) {
-            clients.push_back(std::make_unique<StorageClient>(connStr));
+            clients.push_back(std::make_unique<StorageClient>(store));
             clients.back()->init();
         }
     }
@@ -262,7 +236,7 @@ struct MultiClientEnv {
 TEST_F(StorageClientTest, ConcurrentWriteReadRoundTrip) {
     constexpr int kNumClients = 8;
 
-    MultiClientEnv env(connStr_, kNumClients);
+    MultiClientEnv env(store_, kNumClients);
 
     std::vector<std::string> ids(kNumClients);
     std::vector<std::string> payloads(kNumClients);
@@ -339,7 +313,7 @@ TEST_F(StorageClientTest, ConcurrentMaxSizePayloadFidelity) {
     constexpr int kNumClients = 6;
     constexpr std::size_t kMaxPayload = 40; // kDataShards(2) * kShardSize(20)
 
-    MultiClientEnv env(connStr_, kNumClients);
+    MultiClientEnv env(store_, kNumClients);
 
     std::vector<std::string> ids(kNumClients);
     std::vector<Bytes> payloads(kNumClients);
@@ -408,7 +382,7 @@ TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
     constexpr int kObjectsPerClient = 5;
     constexpr int kTotalObjects = kNumClients * kObjectsPerClient;
 
-    MultiClientEnv env(connStr_, kNumClients);
+    MultiClientEnv env(store_, kNumClients);
 
     // Prepare IDs and payloads: range 0501..0520
     std::vector<std::vector<std::string>> ids(kNumClients);
@@ -449,7 +423,7 @@ TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
         ".json";
     setenv("MYC_KEYSTORE_PATH", verify_kek.c_str(), 1);
-    StorageClient verify_client(connStr_);
+    StorageClient verify_client(store_);
     verify_client.init();
     setenv("MYC_KEYSTORE_PATH", kek_path_.c_str(), 1);
 
@@ -527,7 +501,7 @@ TEST_F(StorageClientTest, ConcurrentOverwriteSameObjectYieldsConsistentState) {
     constexpr int kNumClients = 4;
     const std::string shared_id = "00000000-0000-0000-0000-000000000601";
 
-    MultiClientEnv env(connStr_, kNumClients);
+    MultiClientEnv env(store_, kNumClients);
 
     // Each client writes a distinct 12-byte payload to the SAME object ID
     std::vector<std::string> candidate_payloads = {
@@ -703,7 +677,7 @@ TEST_F(StorageClientTest, ConcurrentRotateWithReadWrite) {
 
 // Designed to trigger ThreadSanitizer (TSAN) reports if run under
 // -fsanitize=thread. Exercises all code paths that touch shared mutable state
-// (pqxx::connection via MetadataStore, kek_ring_, active_kek_id_) from
+// (MetadataStore, kek_ring_, active_kek_id_) from
 // multiple threads simultaneously.
 TEST_F(StorageClientTest, ThreadSanitizerCleanRun) {
     constexpr int kThreads = 6;

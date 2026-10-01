@@ -40,9 +40,9 @@ for scenario in "${SCENARIOS[@]}"; do
       "$BENCHMARK_BIN"
   done
 
-  # teardown-integration.sh prompts twice (reset node data / reset kek file).
+  # teardown-integration.sh prompts three times (metadata / node data / kek file).
   # Auto-answer "yes" so each scenario starts from a clean cluster.
-  printf 'y\ny\n' | "$SCRIPT_DIR/teardown-integration.sh"
+  printf 'y\ny\ny\n' | "$SCRIPT_DIR/teardown-integration.sh"
 done
 
 echo "Aggregated results written to $OUT_CSV"

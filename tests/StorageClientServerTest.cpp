@@ -2,7 +2,8 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <botan/base64.h>
-#include <pqxx/pqxx>
+
+#include "MetadataClient.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -26,47 +27,20 @@ int testPort() {
     return kDefaultPort;
 }
 
-std::string testConnectionString() {
-    if (const char* env = std::getenv("METADATASTORE_TEST_CONN")) {
+// Metadata cluster used by the running storage_client (see setup-integration.sh).
+std::string testMetadataEndpoints() {
+    if (const char* env = std::getenv("METADATA_TEST_ENDPOINTS")) {
         return std::string{env};
     }
-
-    return "host=localhost "
-           "port=5433 "
-           "dbname=myc_test "
-           "user=test_user "
-           "password=test_password";
+    return "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003";
 }
 
 class StorageClientServerTest : public ::testing::Test {
 protected:
     httplib::Client client_{testHost(), testPort()};
 
-    void SetUp() override {
-        seedNodes();
-    }
-
     void cleanup(const std::string& id) {
         (void)client_.Delete("/objects/" + id);
-    }
-
-    void seedNodes() {
-        pqxx::connection conn{testConnectionString()};
-        pqxx::work tx{conn};
-
-        tx.exec(R"SQL(
-            CREATE TABLE IF NOT EXISTS nodes (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                address TEXT NOT NULL UNIQUE,
-                registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        )SQL");
-
-        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9001') ON CONFLICT DO NOTHING");
-        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9002') ON CONFLICT DO NOTHING");
-        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9003') ON CONFLICT DO NOTHING");
-
-        tx.commit();
     }
 };
 
@@ -320,14 +294,11 @@ TEST_F(StorageClientServerTest, RepairRestoresDegradedObject) {
     // We know shard 0 is on node 9001 (first eligible node by registry order)
     // Construct the shard location from the object metadata
     {
-        pqxx::connection conn{testConnectionString()};
-        pqxx::read_transaction tx{conn};
-        auto rows = tx.exec(
-            "SELECT location FROM object_shard_locations "
-            "WHERE object_id = '" + id + "' ORDER BY shard_index ASC LIMIT 1"
-        );
-        ASSERT_FALSE(rows.empty());
-        std::string full_location = rows[0][0].c_str();
+        MetadataClient store(MetadataClient::parse_endpoints(testMetadataEndpoints()));
+        const auto metadata = store.get(id);
+        ASSERT_TRUE(metadata.has_value());
+        ASSERT_FALSE(metadata->shard_locations.empty());
+        const std::string full_location = metadata->shard_locations[0];
         // full_location is "host:port/key" - extract path after first /
         std::string shard_key = full_location.substr(full_location.find('/') + 1);
 

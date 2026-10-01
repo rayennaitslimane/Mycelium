@@ -1,14 +1,14 @@
 #pragma once
 
 // Concurrency contract:
-// 1. MetadataStore access uses a bounded pqxx::connection pool; each connection
-//    is checked out to one thread at a time, so operations run concurrently.
+// 1. Metadata access goes through IMetadataStore; the LMDB/Raft implementations
+//    serialize mutations themselves, so no client-side lock is needed.
 // 2. KEK ring reads (put/get) are shared-locked; writes (rotate) are exclusive-locked.
 // 3. StorageNode requires no application-level locking (LMDB handles it).
 // 4. Per-object ordering is NOT guaranteed. Concurrent mutations on the same object
 //    may interleave; last metadata write wins. Orphaned shards are tolerated.
 
-#include "MetadataStore.hpp"
+#include "IMetadataStore.hpp"
 #include "MetricsCollector.hpp"
 #include "Models.hpp"
 
@@ -22,7 +22,7 @@
 
 class StorageClient {
 public:
-    explicit StorageClient(const std::string& metadata_conn_str);
+    explicit StorageClient(std::shared_ptr<IMetadataStore> metadata_store);
     ~StorageClient();
 
     void init();
@@ -34,7 +34,7 @@ public:
     ObjectHealth health(const std::string& object_id);
     bool repair(const std::string& object_id);
 
-    MetadataStore& metadata_store() { return metadata_store_; }
+    IMetadataStore& metadata_store() { return *metadata_store_; }
     void set_collector(MetricsCollector* c) { collector_ = c; }
 
     StorageClient(const StorageClient&) = delete;
@@ -44,7 +44,7 @@ public:
     StorageClient& operator=(StorageClient&&) = delete;
 
 private:
-    MetadataStore metadata_store_;
+    std::shared_ptr<IMetadataStore> metadata_store_;
     mutable std::shared_mutex kek_mu_;
     std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> kek_ring_;
     std::string active_kek_id_;

@@ -11,6 +11,11 @@
 > thread-safe even for reads) is unchanged; only the mechanism that enforces it
 > changed.
 
+> **Amendment (2026-10-01):** PostgreSQL is replaced by LMDB-backed metadata
+> replicated through Raft ([ADR-0008](0008-raft-metadata.md)). See the
+> [Amendment](#amendment-2026-10-01-lmdb-and-raft-metadata) section at the end of
+> this document.
+
 ## Context
 
 `StorageClientServer` and `StorageNodeServer` both embed a `httplib::Server` (see ADR-0005), which dispatches incoming requests from an internal thread pool. This means every public method of `StorageClient`, `MetadataStore`, and `StorageNode` can be invoked concurrently by multiple handler threads.
@@ -193,3 +198,34 @@ natural next step if throughput becomes a constraint"). That step is now taken.
   within Postgres defaults).
 - Multi-process deployment is still out of scope (each process has its own pool);
   the multi-process caveat above is unchanged.
+
+## Amendment (2026-10-01): LMDB and Raft metadata
+
+### What changed
+
+- `MetadataStore` no longer has a connection pool or a mutex. LMDB provides
+  MVCC readers and a single writer, so concurrent reads run in parallel and
+  writes are serialised by LMDB itself, the same reasoning as §3 for
+  `StorageNode`.
+- Every mutation is a `MetadataCommand` applied by `MetadataStore::apply` in one
+  LMDB write transaction. When replicated (ADR-0008), the Raft log provides a
+  single total order of mutations across all clients and processes.
+- `conditional_put` (§5) is a compare-and-swap evaluated inside `apply`: the
+  stored version is compared with `expected_version` in the same write
+  transaction that writes the new record.
+
+### Restated invariant #1 (LMDB / Raft)
+
+> **Metadata serialization**: all metadata mutations are applied one at a time,
+> in log order, each in its own LMDB write transaction. Reads observe a
+> consistent LMDB snapshot. A mutation is either fully applied (including
+> `last_applied`) or not applied at all.
+
+### Consequences of the amendment
+
+- The multi-process caveat is resolved. Clients in different processes are
+  coordinated by the Raft leader, so version fencing holds across processes.
+- The tolerated-races table is otherwise unchanged. Per-object ordering is
+  still not guaranteed, last write wins, and orphaned shards remain inert.
+- The pool-sizing consequences and the `metadata_benchmark` harness described
+  in the 2026-06-22 amendment no longer apply; the harness is removed.

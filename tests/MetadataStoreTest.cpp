@@ -1,12 +1,13 @@
+#include "LmdbTxn.hpp"
 #include "MetadataStore.hpp"
 #include "Models.hpp"
 
 #include <gtest/gtest.h>
-#include <pqxx/pqxx>
 
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -14,20 +15,9 @@
 #include <utility>
 #include <vector>
 
+namespace fs = std::filesystem;
+
 namespace {
-
-std::string testConnectionString() {
-    if (const char* env = std::getenv("METADATASTORE_TEST_CONN")) {
-        return std::string{env};
-    }
-
-    // Matches docker-compose.yml
-    return "host=localhost "
-           "port=5433 "
-           "dbname=myc_test "
-           "user=test_user "
-           "password=test_password";
-}
 
 ErasureSpec makeErasureSpec() {
     // Adapt this if your ErasureSpec constructor differs.
@@ -69,54 +59,26 @@ void expectMetadataEqual(
 class MetadataStoreTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        connStr_ = testConnectionString();
-
-        // Constructor creates schema and prepares statements.
-        store_ = std::make_unique<MetadataStore>(connStr_);
-
-        clearDatabase();
+        test_dir_ = fs::temp_directory_path() /
+            ("metadata_store_test_" +
+             std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + "_" +
+             std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+        fs::remove_all(test_dir_);
+        store_ = std::make_unique<MetadataStore>(test_dir_.string());
     }
 
     void TearDown() override {
-        clearDatabase();
         store_.reset();
+        std::error_code ec;
+        fs::remove_all(test_dir_, ec);
     }
 
-    void clearDatabase() {
-        pqxx::connection conn{connStr_};
-        pqxx::work tx{conn};
-
-        tx.exec(R"SQL(
-            TRUNCATE TABLE
-                object_shard_locations,
-                object_metadata,
-                nodes
-            RESTART IDENTITY
-            CASCADE
-        )SQL");
-
-        tx.commit();
+    void reopen() {
+        store_.reset();
+        store_ = std::make_unique<MetadataStore>(test_dir_.string());
     }
 
-    std::int64_t countShardLocationsForObject(const std::string& objectId) {
-        pqxx::connection conn{connStr_};
-        pqxx::work tx{conn};
-
-        const pqxx::result result = tx.exec(
-            R"SQL(
-                SELECT COUNT(*)
-                FROM object_shard_locations
-                WHERE object_id = $1::uuid
-            )SQL",
-            pqxx::params{
-                objectId
-            }
-        );
-
-        return result[0][0].as<std::int64_t>();
-    }
-
-    std::string connStr_;
+    fs::path test_dir_;
     std::unique_ptr<MetadataStore> store_;
 };
 
@@ -164,7 +126,7 @@ TEST_F(MetadataStoreTest, PutExistingObjectUpdatesMetadataAndReplacesShardLocati
 
     store_->put(original);
 
-    ASSERT_EQ(3, countShardLocationsForObject(id));
+    ASSERT_EQ(3u, store_->get(id)->shard_locations.size());
 
     const auto updated = makeMetadata(
         id,
@@ -182,8 +144,8 @@ TEST_F(MetadataStoreTest, PutExistingObjectUpdatesMetadataAndReplacesShardLocati
     ASSERT_TRUE(loaded.has_value());
     expectMetadataEqual(updated, *loaded);
 
-    // Verifies old shard rows were deleted instead of appended to.
-    EXPECT_EQ(1, countShardLocationsForObject(id));
+    // Verifies old shard locations were replaced instead of appended to.
+    EXPECT_EQ(1u, loaded->shard_locations.size());
 }
 
 TEST_F(MetadataStoreTest, RemoveExistingObjectDeletesMetadataAndCascadesShardLocations) {
@@ -202,15 +164,12 @@ TEST_F(MetadataStoreTest, RemoveExistingObjectDeletesMetadataAndCascadesShardLoc
     store_->put(metadata);
 
     ASSERT_TRUE(store_->get(id).has_value());
-    ASSERT_EQ(2, countShardLocationsForObject(id));
 
     const bool removed = store_->remove(id);
 
     EXPECT_TRUE(removed);
     EXPECT_FALSE(store_->get(id).has_value());
-
-    // object_shard_locations has ON DELETE CASCADE.
-    EXPECT_EQ(0, countShardLocationsForObject(id));
+    EXPECT_TRUE(store_->list().empty());
 }
 
 TEST_F(MetadataStoreTest, RemoveMissingObjectReturnsFalse) {
@@ -320,7 +279,7 @@ TEST_F(MetadataStoreTest, PutRejectsEmptyShardLocation) {
     EXPECT_THROW(store_->put(metadata), std::invalid_argument);
 }
 
-TEST_F(MetadataStoreTest, PutRejectsInvalidUuidFromDatabaseCast) {
+TEST_F(MetadataStoreTest, PutRejectsInvalidUuid) {
     auto metadata = makeMetadata(
         "not-a-valid-uuid",
         123,
@@ -330,9 +289,136 @@ TEST_F(MetadataStoreTest, PutRejectsInvalidUuidFromDatabaseCast) {
         }
     );
 
-    // validate_metadata only checks non-empty ID.
-    // PostgreSQL should reject this because prepared SQL casts $1::uuid.
-    EXPECT_THROW(store_->put(metadata), std::exception);
+    EXPECT_THROW(store_->put(metadata), std::invalid_argument);
+}
+
+TEST_F(MetadataStoreTest, PutAssignsIncrementingVersions) {
+    const std::string id = "00000000-0000-0000-0000-000000000007";
+    auto metadata = makeMetadata(id, 1, "sha256:v", {"node-a:/v/shard-0"});
+
+    store_->put(metadata);
+    EXPECT_EQ(1, store_->get(id)->version);
+
+    store_->put(metadata);
+    EXPECT_EQ(2, store_->get(id)->version);
+}
+
+TEST_F(MetadataStoreTest, ConditionalPutIsCompareAndSwapOnVersion) {
+    const std::string id = "00000000-0000-0000-0000-000000000008";
+    auto metadata = makeMetadata(id, 1, "sha256:cas", {"node-a:/cas/shard-0"});
+
+    EXPECT_FALSE(store_->conditional_put(metadata, 0)) << "missing object";
+
+    store_->put(metadata);
+    metadata.shard_locations = {"node-b:/cas/shard-0"};
+
+    EXPECT_FALSE(store_->conditional_put(metadata, 7)) << "version mismatch";
+    EXPECT_EQ("node-a:/cas/shard-0", store_->get(id)->shard_locations[0]);
+
+    EXPECT_TRUE(store_->conditional_put(metadata, 1));
+    const auto loaded = store_->get(id);
+    EXPECT_EQ(2, loaded->version);
+    EXPECT_EQ("node-b:/cas/shard-0", loaded->shard_locations[0]);
+}
+
+TEST_F(MetadataStoreTest, ListNodesPreservesRegistrationOrder) {
+    store_->register_node("localhost:9003");
+    store_->register_node("localhost:9001");
+    store_->register_node("localhost:9002");
+    store_->register_node("localhost:9003");  // no-op
+
+    EXPECT_EQ(
+        (std::vector<std::string>{"localhost:9003", "localhost:9001", "localhost:9002"}),
+        store_->list_nodes()
+    );
+
+    EXPECT_TRUE(store_->unregister_node("localhost:9003"));
+    EXPECT_FALSE(store_->unregister_node("localhost:9003"));
+    store_->register_node("localhost:9003");
+
+    EXPECT_EQ(
+        (std::vector<std::string>{"localhost:9001", "localhost:9002", "localhost:9003"}),
+        store_->list_nodes()
+    );
+}
+
+TEST_F(MetadataStoreTest, ApplySkipsAlreadyAppliedLogIndexes) {
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::Put;
+    cmd.metadata = makeMetadata(
+        "00000000-0000-0000-0000-000000000009", 1, "sha256:log", {"node-a:/log/shard-0"});
+
+    EXPECT_TRUE(store_->apply(cmd, 5).ok);
+    EXPECT_EQ(5u, store_->last_applied());
+
+    // Replays at or below last_applied are no-ops.
+    EXPECT_FALSE(store_->apply(cmd, 5).ok);
+    EXPECT_FALSE(store_->apply(cmd, 3).ok);
+    EXPECT_EQ(1, store_->get(cmd.metadata.id)->version);
+
+    EXPECT_TRUE(store_->apply(cmd, 6).ok);
+    EXPECT_EQ(2, store_->get(cmd.metadata.id)->version);
+    EXPECT_EQ(6u, store_->last_applied());
+}
+
+TEST_F(MetadataStoreTest, StatePersistsAcrossReopen) {
+    const auto metadata = makeMetadata(
+        "00000000-0000-0000-0000-00000000000a", 42, "sha256:persist", {"node-a:/p/shard-0"});
+    store_->put(metadata);
+    store_->register_node("localhost:9001");
+    const std::uint64_t applied = store_->last_applied();
+
+    reopen();
+
+    const auto loaded = store_->get(metadata.id);
+    ASSERT_TRUE(loaded.has_value());
+    expectMetadataEqual(metadata, *loaded);
+    EXPECT_EQ(std::vector<std::string>{"localhost:9001"}, store_->list_nodes());
+    EXPECT_EQ(applied, store_->last_applied());
+}
+
+TEST_F(MetadataStoreTest, ApplyDeduplicatesRequestIds) {
+    MetadataCommand cmd;
+    cmd.op = MetadataOp::Put;
+    cmd.request_id = "req-1";
+    cmd.metadata = makeMetadata(
+        "00000000-0000-0000-0000-00000000000b", 1, "sha256:dedup", {"node-a:/d/shard-0"});
+
+    EXPECT_TRUE(store_->apply(cmd, 1).ok);
+    EXPECT_TRUE(store_->apply(cmd, 2).ok) << "duplicate returns the original result";
+    EXPECT_EQ(1, store_->get(cmd.metadata.id)->version);
+    EXPECT_EQ(2u, store_->last_applied());
+
+    cmd.request_id = "req-2";
+    EXPECT_TRUE(store_->apply(cmd, 3).ok);
+    EXPECT_EQ(2, store_->get(cmd.metadata.id)->version);
+}
+
+TEST_F(MetadataStoreTest, SnapshotRoundTripsIntoAnotherStore) {
+    const auto metadata = makeMetadata(
+        "00000000-0000-0000-0000-00000000000c", 7, "sha256:snap", {"node-a:/s/shard-0"});
+    store_->put(metadata);
+    store_->register_node("localhost:9001");
+
+    const fs::path chunks = test_dir_ / "chunks";
+    const fs::path other_dir = test_dir_ / "other";
+    fs::create_directories(chunks);
+    std::size_t count = 0;
+    {
+        auto txn = store_->begin_snapshot_read();
+        count = store_->write_snapshot_chunks(*txn, chunks.string());
+    }
+    ASSERT_GE(count, 1u);
+
+    MetadataStore other(other_dir.string());
+    other.register_node("stale:1");
+    other.restore_snapshot(chunks.string(), count, 42);
+
+    const auto loaded = other.get(metadata.id);
+    ASSERT_TRUE(loaded.has_value());
+    expectMetadataEqual(metadata, *loaded);
+    EXPECT_EQ(std::vector<std::string>{"localhost:9001"}, other.list_nodes());
+    EXPECT_EQ(42u, other.last_applied());
 }
 
 // ===========================================================================
@@ -340,8 +426,8 @@ TEST_F(MetadataStoreTest, PutRejectsInvalidUuidFromDatabaseCast) {
 // ===========================================================================
 
 // Verifies that concurrent put/get/remove/list on a single MetadataStore
-// instance (bounded pqxx::connection pool) does not crash, deadlock, or produce
-// data races. Validates contract point 1: MetadataStore connection isolation.
+// instance (LMDB MVCC readers, single writer) does not crash, deadlock, or
+// produce data races. Validates contract point 1.
 TEST_F(MetadataStoreTest, ConcurrentMetadataStoreAccessOnSingleClient) {
     constexpr int kNumThreads = 8;
     constexpr int kOpsPerThread = 10;

@@ -1,7 +1,13 @@
 # ADR-0003: Dual Storage
 
-**Status:** Accepted  
+**Status:** Accepted (amended)  
 **Date:** 2026-06-11
+
+> **Amendment (2026-10-01):** Object metadata no longer lives in PostgreSQL. It
+> is stored in LMDB and replicated with Raft ([ADR-0008](0008-raft-metadata.md)).
+> See the [Amendment](#amendment-2026-10-01-metadata-moves-to-raft-replicated-lmdb)
+> section at the end of this document. The shard-payload half of this decision is
+> unchanged.
 
 ## Context
 
@@ -95,3 +101,18 @@ For a collection of N objects this produces N+1 total round-trips to PostgreSQL.
 - Versioned shard keys can leave orphaned shard payloads for losing concurrent writers and for `put/remove` races on the same object ID. This is an intentional storage-leak trade-off that preserves read correctness under the ADR-0006 contract.
 - Multi-process writers sharing the same PostgreSQL metadata are not coordinated by this design; the documented concurrency contract assumes single-process ownership of one `StorageClient` instance.
 - The `erasure_spec` field is stored as `BYTEA` (msgpack blob) rather than as structured columns, making it opaque to SQL queries and migrations.
+
+## Amendment (2026-10-01): Metadata moves to Raft-replicated LMDB
+
+### What changed
+
+- PostgreSQL and libpqxx are removed. `MetadataStore` is an LMDB environment with `objects`, `nodes` and `meta` DBIs. Each object record is one msgpack `ObjectMetadata` value that carries its shard locations, so deleting the record removes the locations with it (this replaces `ON DELETE CASCADE`).
+- The node registry keeps registration order through a per-node sequence number (this replaces `ORDER BY registered_at`).
+- Object IDs are validated as UUIDs in code (this replaces the `::uuid` cast).
+- Replication, leader election and the multi-process story are defined in [ADR-0008](0008-raft-metadata.md).
+
+### Consequences of the amendment
+
+- Both halves of the dual-storage split now use LMDB, but they stay separate stores with different owners: storage nodes own shard payloads, and metadata servers own metadata.
+- The pqxx connection-pool and N+1 `list()` notes above are obsolete. `list()` is a single cursor scan.
+- Ad-hoc SQL queries over metadata are no longer possible. All access goes through `IMetadataStore`.
