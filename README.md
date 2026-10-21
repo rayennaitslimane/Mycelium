@@ -129,6 +129,29 @@ serviceable during backfill, with less redundancy for new writes in the meantime
 To restart a killed node, copy its command line from the first line of its log
 (`head -1 run/node1.log`). Because it was out, it purges its data and rejoins as a spare.
 
+### Profiling
+
+Gateways and nodes time each stage of every GET, PUT and DELETE (`core/prof`). Run some requests, then read the table:
+
+```sh
+curl -s localhost:8080/debug/prof   # gateway: GW.<op>.<stage>
+curl -s localhost:9001/debug/prof   # a node:    <op>.<stage>
+```
+
+Each line is `n` (calls), `mean` and `max` for one stage, e.g. `PUT.commit  n=120  mean=3.1ms  max=19ms`.
+A stage's time is measured from the end of the previous one, so the stages add up to `<op>.total`.
+
+| Where | Op | Stages |
+|---|---|---|
+| Node | `GET` | `lock`, `fetch`, `decode` |
+| Node | `PUT`, `DELETE` | `lock`, `encode`, `put`, `commit` |
+| Gateway | `GW.GET` | `forward`, `open` (sealing on) |
+| Gateway | `GW.PUT` | `read`, `seal` (sealing on), `forward` |
+| Gateway | `GW.DELETE` | `forward` |
+
+Counters live in memory, start at zero on restart, and only cover requests since then. A stage is recorded only if the operation reaches it.
+To time a new stage, call `t.Stage("name")` after it. See `node/primary/io.go`.
+
 ### Encryption
 
 The gateway can seal every object before it reaches a node ([ADR 0011](docs/adr/0011-gateway-object-encryption.md)).

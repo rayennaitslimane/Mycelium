@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"mycelium/core/prof"
 	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/gateway/front"
@@ -69,6 +70,7 @@ func run(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/objects/", front.New(maps, client, maxRetries, ring))
+	mux.HandleFunc("GET /debug/prof", prof.Handler)
 	srv := &http.Server{Addr: *listen, Handler: mux}
 	go func() {
 		<-ctx.Done()

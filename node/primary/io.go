@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/prof"
 	"mycelium/core/wire"
 	"mycelium/node/codec"
 	"mycelium/node/peers"
@@ -23,12 +24,15 @@ var (
 // as one (k absent -> not found). Disagreement, checksum failure or fewer than k
 // answers -> inactive + re-peer.
 func (s *pgState) read(ctx context.Context, id string) ([]byte, mapmodel.Version, error) {
+	t := prof.Start("GET")
+	defer t.End()
 	am, release, err := s.begin(true)
 	if err != nil {
 		return nil, mapmodel.Version{}, err
 	}
 	defer release()
 	defer s.locks.lock(id)()
+	t.Stage("lock")
 
 	shards := make([][]byte, am.Params.N())
 	var agreed *wire.Shard
@@ -56,7 +60,9 @@ func (s *pgState) read(ctx context.Context, id string) ([]byte, mapmodel.Version
 		agreed = sh
 		shards[slot] = sh.Data
 		if count++; count == am.Params.K {
+			t.Stage("fetch")
 			obj, err := s.mg.codec.Decode(shards, sh.Size)
+			t.Stage("decode")
 			if err != nil {
 				return nil, mapmodel.Version{}, s.fail(am, err)
 			}
@@ -78,12 +84,19 @@ func (s *pgState) delete(ctx context.Context, id string) (mapmodel.Version, erro
 // put: under the object lock, v = (epoch, ++seq); encode, PUT to every slot in U,
 // commit on every slot in U. Any failure: inactive + re-peer.
 func (s *pgState) put(ctx context.Context, id string, data []byte, deleted bool) (mapmodel.Version, error) {
+	op := "PUT"
+	if deleted {
+		op = "DELETE"
+	}
+	t := prof.Start(op)
+	defer t.End()
 	am, release, err := s.begin(true)
 	if err != nil {
 		return mapmodel.Version{}, err
 	}
 	defer release()
 	defer s.locks.lock(id)()
+	t.Stage("lock")
 
 	v := s.nextVersion(am)
 	shards := make([][]byte, am.Params.N())
@@ -92,7 +105,8 @@ func (s *pgState) put(ctx context.Context, id string, data []byte, deleted bool)
 			return mapmodel.Version{}, s.fail(am, err)
 		}
 	}
-	if err := s.putAndCommit(ctx, am, id, v, int64(len(data)), deleted, shards, am.U(s.id)); err != nil {
+	t.Stage("encode")
+	if err := s.putAndCommit(ctx, am, id, v, int64(len(data)), deleted, shards, am.U(s.id), t); err != nil {
 		return mapmodel.Version{}, s.fail(am, err)
 	}
 	return v, nil
@@ -102,20 +116,23 @@ func (s *pgState) put(ctx context.Context, id string, data []byte, deleted bool)
 // commits v on them (all must ack). If a PUT fails, nothing was committed yet and
 // v is discarded best-effort. After a commit failure v is left for peering: some
 // holders may have committed it, and a discard would delete it there with nothing older left.
-func (s *pgState) putAndCommit(ctx context.Context, am *mapmodel.Map, id string, v mapmodel.Version, size int64, deleted bool, shards [][]byte, slots []int) error {
+func (s *pgState) putAndCommit(ctx context.Context, am *mapmodel.Map, id string, v mapmodel.Version, size int64, deleted bool, shards [][]byte, slots []int, t *prof.T) error {
 	err := s.forSlots(slots, func(slot int) error {
 		sh := &wire.Shard{ID: id, Version: v, Size: size, Deleted: deleted, Data: shards[slot]}
 		sh.Sha256 = codec.Sha256(sh.Data)
 		return s.mg.peers.Put(ctx, am, s.id, slot, sh)
 	})
+	t.Stage("put")
 	items := []wire.IDVersion{{ID: id, Version: v}}
 	if err != nil {
 		s.discardBestEffort(ctx, am, items, slots)
 		return err
 	}
-	return s.forSlots(slots, func(slot int) error {
+	err = s.forSlots(slots, func(slot int) error {
 		return s.mg.peers.Commit(ctx, am, s.id, slot, items)
 	})
+	t.Stage("commit")
+	return err
 }
 
 // discardBestEffort ignores errors and the caller's cancellation (the client may be gone).
@@ -168,7 +185,7 @@ func (s *pgState) reencode(ctx context.Context, am *mapmodel.Map, id string, v m
 			return err
 		}
 	}
-	return s.putAndCommit(ctx, am, id, v, meta.Size, meta.Deleted, out, slots)
+	return s.putAndCommit(ctx, am, id, v, meta.Size, meta.Deleted, out, slots, nil)
 }
 
 // forSlots runs fn on every slot in parallel. It returns ErrStepDown if any call

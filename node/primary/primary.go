@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/prof"
 	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/node/agent"
@@ -95,6 +96,7 @@ func (mg *Manager) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /objects/{id}", mg.handleObject)
 	mux.HandleFunc("PUT /objects/{id}", mg.handleObject)
 	mux.HandleFunc("DELETE /objects/{id}", mg.handleObject)
+	mux.HandleFunc("GET /debug/prof", prof.Handler)
 }
 
 // handleObject answers 421 if not primary for pg(id), 503 if the PG is inactive or

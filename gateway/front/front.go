@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"mycelium/core/prof"
 	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/gateway/mapcache"
@@ -52,6 +53,8 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	t := prof.Start("GW." + r.Method)
+	defer t.End()
 	m := f.maps.Get()
 	if m == nil {
 		var err error
@@ -73,16 +76,19 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		t.Stage("read")
 		if f.ring != nil {
 			var err error
 			if body, err = f.ring.Seal(id, body); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			t.Stage("seal")
 		}
 	}
 
 	status, h, rb, err := f.forward(r.Context(), r.Method, id, body)
+	t.Stage("forward")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -92,6 +98,7 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		t.Stage("open")
 	}
 	for _, k := range []string{wire.HeaderVersion, "Content-Type"} {
 		if v := h.Get(k); v != "" {

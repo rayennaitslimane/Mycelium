@@ -1,3 +1,5 @@
 bin/
 run/
 .botan/
+ring.key
+ring.pub
