@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/gateway/front"
 	"mycelium/gateway/mapcache"
@@ -68,6 +69,17 @@ type Node struct {
 // rest are spares) and a gateway. Everything is stopped when the test ends.
 func NewCluster(t *testing.T, n, k, m int) *Cluster {
 	t.Helper()
+	return newCluster(t, n, k, m, nil)
+}
+
+// NewSealedCluster is NewCluster with a gateway that seals every object under ring.
+func NewSealedCluster(t *testing.T, n, k, m int, ring *seal.Ring) *Cluster {
+	t.Helper()
+	return newCluster(t, n, k, m, ring)
+}
+
+func newCluster(t *testing.T, n, k, m int, ring *seal.Ring) *Cluster {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("cluster scenario: skipped with -short")
 	}
@@ -90,7 +102,7 @@ func NewCluster(t *testing.T, n, k, m int) *Cluster {
 
 	client := wire.NewClient(10 * time.Second)
 	gwMux := http.NewServeMux()
-	gwMux.Handle("/objects/", front.New(mapcache.New([]string{c.monURL}, client), client, 5))
+	gwMux.Handle("/objects/", front.New(mapcache.New([]string{c.monURL}, client), client, 5, ring))
 	gwSrv := httptest.NewServer(gwMux)
 	c.gwURL = gwSrv.URL
 

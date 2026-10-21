@@ -33,7 +33,8 @@ for i in $(seq 1 "$NODES"); do
   start "node$i" bin/node -id "node$i" -addr "http://127.0.0.1:$port" \
     -listen "127.0.0.1:$port" -data "$RUN/node$i" -monitors "$MON"
 done
-start gateway bin/gateway -listen 127.0.0.1:8080 -monitors "$MON"
+# KEYRING=path seals objects at the gateway (see cmd/keyring); unset stores plaintext.
+start gateway bin/gateway -listen 127.0.0.1:8080 -monitors "$MON" ${KEYRING:+-keyring "$KEYRING"}
 
 echo
 echo "objects: http://127.0.0.1:8080/objects/{id}    map: $MON/map    Ctrl-C to stop"

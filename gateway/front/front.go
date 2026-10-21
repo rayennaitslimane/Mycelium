@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/gateway/mapcache"
 )
@@ -25,14 +26,18 @@ type Front struct {
 	maps       *mapcache.Cache
 	client     *wire.Client
 	maxRetries int
+	ring       *seal.Ring
 }
 
-func New(maps *mapcache.Cache, c *wire.Client, maxRetries int) *Front {
-	return &Front{maps: maps, client: c, maxRetries: maxRetries}
+// New returns the front. With a non-nil ring, bodies are sealed before they leave the
+// gateway and opened on the way back, so nodes never see plaintext (ADR 0011).
+func New(maps *mapcache.Cache, c *wire.Client, maxRetries int, ring *seal.Ring) *Front {
+	return &Front{maps: maps, client: c, maxRetries: maxRetries, ring: ring}
 }
 
 // ServeHTTP handles GET, PUT and DELETE /objects/{id}. Bodies over max_object get 413.
-// The primary's reply (status, version header, body) is passed through.
+// The primary's reply (status, version header, body) is passed through; a 200 GET body is
+// opened first when sealing is on, and failure to open it gives 502.
 func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id, ok := strings.CutPrefix(r.URL.Path, "/objects/")
 	if !ok || id == "" {
@@ -68,12 +73,25 @@ func (f *Front) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		if f.ring != nil {
+			var err error
+			if body, err = f.ring.Seal(id, body); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 	}
 
 	status, h, rb, err := f.forward(r.Context(), r.Method, id, body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
+	}
+	if f.ring != nil && r.Method == http.MethodGet && status == http.StatusOK {
+		if rb, err = f.ring.Open(id, rb); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 	}
 	for _, k := range []string{wire.HeaderVersion, "Content-Type"} {
 		if v := h.Get(k); v != "" {

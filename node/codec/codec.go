@@ -1,12 +1,13 @@
 // Package codec is the cgo binding to the C++ erasure codec and sha256 (codec.h). Pure.
 package codec
 
-// botan-2.pc emits link flags cgo rejects by default; build with
+// botan-3.pc emits link flags cgo rejects by default; build with
 // CGO_LDFLAGS_ALLOW='-fstack-protector|-m64' (or set it once with go env -w).
+// Botan 3.12 is built by scripts/build-botan.sh; see the README.
 
 /*
 #cgo CXXFLAGS: -std=c++20
-#cgo pkg-config: libisal botan-2
+#cgo pkg-config: libisal botan-3
 #include "codec.h"
 */
 import "C"

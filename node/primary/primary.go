@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/node/agent"
 	"mycelium/node/codec"
@@ -120,12 +121,14 @@ func (mg *Manager) handleObject(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		data, v, err = s.read(r.Context(), id)
 	case http.MethodPut:
-		body, rerr := io.ReadAll(io.LimitReader(r.Body, m.Params.MaxObject+1))
+		// A sealed object is up to seal.Overhead bytes larger than the plaintext limit.
+		limit := m.Params.MaxObject + int64(seal.Overhead)
+		body, rerr := io.ReadAll(io.LimitReader(r.Body, limit+1))
 		if rerr != nil {
 			http.Error(w, rerr.Error(), http.StatusBadRequest)
 			return
 		}
-		if int64(len(body)) > m.Params.MaxObject {
+		if int64(len(body)) > limit {
 			http.Error(w, "object too large", http.StatusRequestEntityTooLarge)
 			return
 		}

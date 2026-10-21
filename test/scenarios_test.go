@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/seal"
 	"mycelium/core/wire"
 	"mycelium/node/codec"
 	"mycelium/node/peers"
@@ -353,4 +355,42 @@ func TestCutOffPrimary(t *testing.T) {
 		}
 	}
 	c.Expect("co/0", ptr("written by the new primary"))
+}
+
+// ADR 0011: with a keyring the gateway seals objects, so nodes only ever hold ciphertext.
+func TestSealedObjects(t *testing.T) {
+	rec, err := seal.Generate(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring, err := seal.LoadRing(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ring.Close()
+
+	c := NewSealedCluster(t, 3, 1, 2, ring)
+	secret := strings.Repeat("plaintext-marker;", 8)
+	for id, value := range map[string]string{"s": secret, "empty": "", "exactly-max": strings.Repeat("x", maxObject)} {
+		c.Put(id, value)
+		c.Expect(id, ptr(value))
+	}
+	if r := c.Must(http.MethodPut, "too-big", []byte(strings.Repeat("x", maxObject+1))); r.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT over max_object: %d, want 413", r.Status)
+	}
+
+	m := c.Map()
+	pg := m.PGOf("s")
+	for slot, s := range m.PGs[pg] {
+		sh, err := c.Node(s.Node).Store.Get(pg, ^mapmodel.Epoch(0), "s", nil)
+		if err != nil {
+			t.Fatalf("slot %d: %v", slot, err)
+		}
+		if bytes.Contains(sh.Data, []byte("plaintext-marker")) {
+			t.Fatalf("slot %d holds plaintext", slot)
+		}
+		if int(sh.Size) != len(secret)+seal.Overhead {
+			t.Fatalf("slot %d: size %d, want %d", slot, sh.Size, len(secret)+seal.Overhead)
+		}
+	}
 }

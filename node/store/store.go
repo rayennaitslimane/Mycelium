@@ -2,12 +2,13 @@
 // It is the only owner of the per-PG fence.
 package store
 
-// botan-2.pc emits link flags cgo rejects by default; build with
+// botan-3.pc emits link flags cgo rejects by default; build with
 // CGO_LDFLAGS_ALLOW='-fstack-protector|-m64' (or set it once with go env -w).
+// Botan 3.12 is built by scripts/build-botan.sh; see the README.
 
 /*
 #cgo CXXFLAGS: -std=c++20
-#cgo pkg-config: botan-2
+#cgo pkg-config: botan-3
 #include <stdlib.h>
 #include "store.h"
 */

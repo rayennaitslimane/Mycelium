@@ -15,8 +15,9 @@ An object store. An object id hashes to one of `pg_num` placement groups (PGs). 
 core/                 shared by all three, no I/O
     mapmodel          map type and derived rules: pg(id), U, B, primary, version
     wire              request/reply types, status codes, HTTP client helper
+    seal              object envelope encryption (ML-KEM-768 + AES-256-GCM). Pure, C++ (Botan 3)
 gateway/
-    front             serves /objects/{id}: forward to primary, on 421/503 refetch map and retry (bounded)
+    front             serves /objects/{id}: seal/open the body when a keyring is set (ADR 0011), forward to primary, on 421/503 refetch map and retry (bounded)
     mapcache          fetches GET /map, keeps the latest epoch
 monitor/
     transitions       pure (map, event) -> map': join, out, new boot_id, reassign, backfill_done, PG table creation. Bumps epoch
@@ -120,7 +121,7 @@ Any failure: reply `503`, send a best-effort `discard`, and re-peer. A delete is
 
 ## Non-goals
 
-Auth/TLS. Rebalancing when nodes are added. Partial or range I/O. Request IDs: a timed-out request has an unknown outcome, and retries are at-least-once, last-writer-wins. Delta recovery: any node out longer than `grace` is fully re-backfilled. Scrubbing and bitrot repair: a bad checksum just makes the shard unavailable.
+Auth/TLS. Key rotation (rewrapping existing objects). Rebalancing when nodes are added. Partial or range I/O. Request IDs: a timed-out request has an unknown outcome, and retries are at-least-once, last-writer-wins. Delta recovery: any node out longer than `grace` is fully re-backfilled. Scrubbing and bitrot repair: a bad checksum just makes the shard unavailable.
 
 
 

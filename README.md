@@ -31,6 +31,7 @@ primary then backfills the spare.
 | --- | --- | --- |
 | `core/mapmodel` | Go | Map type and the rules derived from it: `pg(id)`, `U`, `B`, primary, versions |
 | `core/wire` | Go | Request/reply types, status codes, HTTP helpers |
+| `core/seal` | C++ | Object envelope encryption (ML-KEM-768 + AES-256-GCM, Botan), used by the gateway |
 | `monitor/transitions` | Go | **All map rules**: pure `(map, event) -> map'` |
 | `monitor/{liveness,store,api,raft}` | Go | Heartbeat timer, durable map file, HTTP API, Raft |
 | `gateway/{front,mapcache}` | Go | Request forwarding and the cached map |
@@ -41,6 +42,7 @@ primary then backfills the spare.
 | `node/store` | C++ | Shard files, the per-PG **fence**, fsync |
 | `node/codec` | C++ | Erasure coding (ISA-L) and sha256 (Botan) |
 | `cmd/{monitor,gateway,node}` | Go | Binaries |
+| `cmd/keyring` | Go | Creates the key ring files the gateway loads |
 | `test/` | Go | Whole-cluster scenarios, run in one process |
 
 The C++ packages are compiled by cgo as part of `go build`. There is no separate build step.
@@ -67,20 +69,26 @@ The decisions that keep the system correct are recorded as short ADRs in
 | [0008](docs/adr/0008-liveness-and-serve-gate.md) | Liveness, the serve gate and the one timing assumption |
 | [0009](docs/adr/0009-raft-monitors.md) | Monitor replication with Raft and leader leases |
 | [0010](docs/adr/0010-shard-durability-and-integrity.md) | Shard durability and integrity |
+| [0011](docs/adr/0011-gateway-object-encryption.md) | Objects are encrypted at the gateway, the only holder of secret keys |
 
 ## Build
 
 Requirements: Go 1.27 (any Go from 1.21 on downloads it automatically on first build), a
-C++20 compiler, `pkg-config`, ISA-L and Botan 2.
+C++20 compiler, `pkg-config`, `curl`, Python 3 and ISA-L. Botan 3.12 is built from source.
 
 ```sh
-sudo apt install g++ pkg-config libisal-dev libbotan-2-dev   # Debian/Ubuntu
-make            # builds bin/monitor, bin/gateway, bin/node
+sudo apt install g++ pkg-config libisal-dev curl python3   # Debian/Ubuntu
+make botan      # once: builds a static, minimal Botan 3.12.0 into .botan/
+make            # builds bin/monitor, bin/gateway, bin/node, bin/keyring
 ```
 
-`make` sets `CGO_LDFLAGS_ALLOW`, because `botan-2.pc` emits link flags that cgo rejects by
-default. If you call `go build` directly, set it yourself:
-`CGO_LDFLAGS_ALLOW='-fstack-protector|-m64' go build ./...`.
+`make` sets `CGO_LDFLAGS_ALLOW`, because `botan-3.pc` emits link flags that cgo rejects by
+default, and points `PKG_CONFIG_PATH` at `.botan/`. If you call `go` directly, set both:
+
+```sh
+export CGO_LDFLAGS_ALLOW='-fstack-protector|-m64' PKG_CONFIG_PATH=$PWD/.botan/lib/pkgconfig
+go build ./...
+```
 
 ## Run a local cluster
 
@@ -120,6 +128,20 @@ serviceable during backfill, with less redundancy for new writes in the meantime
 
 To restart a killed node, copy its command line from the first line of its log
 (`head -1 run/node1.log`). Because it was out, it purges its data and rejoins as a spare.
+
+### Encryption
+
+The gateway can seal every object before it reaches a node ([ADR 0011](docs/adr/0011-gateway-object-encryption.md)).
+Nodes then hold only ciphertext, and only the gateway has keys.
+
+```sh
+bin/keyring gen -id 1 -out ring.key        # a KEK with its secret key (mode 0600)
+KEYRING=ring.key make cluster              # or: bin/gateway ... -keyring ring.key
+bin/keyring pub -in ring.key -out ring.pub # public half only: a gateway given this can PUT but not GET
+```
+
+Without `-keyring` the gateway stores plaintext. The first KEK in a ring file seals; to add
+one, `cat new.key old.key > ring.key`. Rewrapping old objects (rotation) is not implemented.
 
 ### Replicated monitors (Raft)
 
@@ -164,7 +186,7 @@ Each test guards a decision in [docs/adr/](docs/adr), so a failure means a guara
 
 ## Status
 
-All components are implemented and covered by the tests above. Non-goals, such as auth,
+All components are implemented and covered by the tests above. Non-goals, such as transport auth,
 rebalancing and range I/O, are listed at the end of [docs/system-design.md](docs/system-design.md).
 
 
