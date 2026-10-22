@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"mycelium/core/mapmodel"
+	"mycelium/core/prof"
 	"mycelium/core/wire"
 )
 
@@ -121,7 +122,10 @@ func (s *pgState) resolve(ctx context.Context, m *mapmodel.Map, id string, held 
 			return err
 		}
 		if len(lack) > 0 {
-			if err := s.reencode(ctx, m, id, w, lack); err != nil {
+			t := prof.Start("REPEER")
+			err := s.reencode(ctx, m, id, w, lack, t)
+			t.End()
+			if err != nil {
 				return err
 			}
 		}

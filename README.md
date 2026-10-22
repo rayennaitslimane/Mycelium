@@ -148,6 +148,13 @@ A stage's time is measured from the end of the previous one, so the stages add u
 | Gateway | `GW.GET` | `forward`, `open` (sealing on) |
 | Gateway | `GW.PUT` | `read`, `seal` (sealing on), `forward` |
 | Gateway | `GW.DELETE` | `forward` |
+| Node | `BACKFILL` (per object) | `lock`, `get`, `lookup`, then if copied: `fetch`, `decode`, `encode`, `put`, `commit` |
+| Node | `BACKFILL_SLOT` (per slot) | `list`, `objects`, `done` |
+| Node | `REPEER` (per object re-encoded while peering) | `fetch`, `decode`, `encode`, `put`, `commit` |
+
+Backfill and re-peering are cyclical: `n` keeps growing with every cycle, including retries.
+For `BACKFILL`, an object the slot already holds stops after `lookup` (skipped), so `lookup` n minus `put` n is the number skipped.
+Read per-stage means rather than `total`, which blends skipped and copied objects.
 
 Counters live in memory, start at zero on restart, and only cover requests since then. A stage is recorded only if the operation reaches it.
 To time a new stage, call `t.Stage("name")` after it. See `node/primary/io.go`.

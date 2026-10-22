@@ -170,22 +170,25 @@ func (s *pgState) fetchShards(ctx context.Context, am *mapmodel.Map, id string, 
 
 // reencode rebuilds version v of id from B and PUTs + commits its shard on each of
 // slots. A tombstone needs no decoding.
-func (s *pgState) reencode(ctx context.Context, am *mapmodel.Map, id string, v mapmodel.Version, slots []int) error {
+func (s *pgState) reencode(ctx context.Context, am *mapmodel.Map, id string, v mapmodel.Version, slots []int, t *prof.T) error {
 	shards, meta, err := s.fetchShards(ctx, am, id, v)
 	if err != nil {
 		return err
 	}
+	t.Stage("fetch")
 	out := make([][]byte, am.Params.N())
 	if !meta.Deleted {
 		obj, err := s.mg.codec.Decode(shards, meta.Size)
 		if err != nil {
 			return err
 		}
+		t.Stage("decode")
 		if out, err = s.mg.codec.Encode(obj); err != nil {
 			return err
 		}
+		t.Stage("encode")
 	}
-	return s.putAndCommit(ctx, am, id, v, meta.Size, meta.Deleted, out, slots, nil)
+	return s.putAndCommit(ctx, am, id, v, meta.Size, meta.Deleted, out, slots, t)
 }
 
 // forSlots runs fn on every slot in parallel. It returns ErrStepDown if any call
