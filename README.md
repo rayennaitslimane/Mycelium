@@ -7,11 +7,40 @@ The design, including every rule and route, is in [docs/system-design.md](docs/s
 
 ## How it works
 
+```mermaid
+flowchart TB
+    client(["Client"])
+    mon[("Monitor<br/>owns the cluster map<br/>(replicated with Raft)")]
+    gw["Gateway<br/>routes each object to its PG"]
+
+    subgraph nodes["Storage nodes"]
+        n1["Node 1<br/>primary · slot 0"]
+        n2["Node 2<br/>slot 1"]
+        n3["Node 3<br/>slot 2"]
+        n4["Node 4<br/>spare"]
+    end
+
+    client -->|"PUT / GET / DELETE"| gw
+    gw -->|"forward"| n1
+    n1 -->|"shards"| n2
+    n1 -->|"shards"| n3
+    n1 -.->|"backfill"| n4
+
+    mon <-.->|"map"| gw
+    mon <-.->|"heartbeats, map"| nodes
+
+    classDef data fill:#d6ecff,stroke:#2b7bd9,color:#000
+    classDef ctrl fill:#fde8c8,stroke:#d9822b,color:#000
+    classDef spare fill:#f0f0f0,stroke:#888,stroke-dasharray:4 3,color:#000
+    class gw,n1,n2,n3 data
+    class mon ctrl
+    class n4 spare
 ```
-client ──HTTP──▶ gateway ──▶ primary node ──▶ holder nodes (one shard each)
-                    │              │
-                    └── GET /map ──┴── heartbeat, join, backfill_done ──▶ monitor
-```
+
+**Solid arrows** carry object data; **dashed arrows** are control traffic. The example shows
+one placement group with `k=2, m=1`, so 3 slots. "Primary" is a role per PG: every node holds
+shards, and each node is the primary of some PGs. When a node fails, the monitor gives its
+slots to the spare, and the primary backfills it.
 
 - **Monitor**: owns the *map*, which says which nodes are `up` and which nodes hold each
   placement group (PG). Every map change bumps the map's version number, the *epoch*. You can

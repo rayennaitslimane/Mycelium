@@ -11,30 +11,6 @@ An object store. An object id hashes to one of `pg_num` placement groups (PGs). 
 - **monitor**: owns the `map` and node states. One instance first, Raft later.
 - **node**: every node is a `holder` (stores shards). It is also the `primary` of the PGs where the map names it so. The primary serializes operations per object.
 
-```
-core/                 shared by all three, no I/O
-    mapmodel          map type and derived rules: pg(id), U, B, primary, version
-    wire              request/reply types, status codes, HTTP client helper
-    seal              object envelope encryption (ML-KEM-768 + AES-256-GCM). Pure, C++ (Botan 3)
-gateway/
-    front             serves /objects/{id}: seal/open the body when a keyring is set (ADR 0011), forward to primary, on 421/503 refetch map and retry (bounded)
-    mapcache          fetches GET /map, keeps the latest epoch
-monitor/
-    transitions       pure (map, event) -> map': join, out, new boot_id, reassign, backfill_done, PG table creation. Bumps epoch
-    liveness          in-memory heartbeat times and boot_ids, grace timer emits "out" events
-    store             durable map (write, fsync, rename)
-    api               HTTP handlers: liveness -> transitions -> store
-node/
-    agent             boot, heartbeat loop, join/purge, map refresh. Owns the serve gate: CanServe(), Map()
-    store             shard files: staged/committed, tombstones, per-PG fence, checksums, fsync, purge, list. No network or map
-    holder            handlers for the shard routes: serve gate + fence check, then store
-    primary           per-PG state: object locks, seq, active/inactive. Files: io (read/write/delete), peering, backfill
-    peers             holder client used by primary: stamps epoch, maps 409 to step-down. HTTP for remote slots, direct call for own slot
-    codec             erasure encode/decode, sha256. Pure
-```
-
-Each rule has one owner: map rules in `transitions`, the serve gate in `agent`, the fence in node `store`. Nothing else re-implements them.
-
 
 ## Config and map
 
@@ -102,6 +78,23 @@ Every Primary -> Holder request carries `epoch`. The holder answers `409 {fence}
 3. Reply with `v`.
 
 Any failure: reply `503`, send a best-effort `discard`, and re-peer. A delete is idempotent: it always succeeds once committed.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant P as Primary
+    participant H as Every slot in U
+    C->>G: PUT /objects/{id}
+    G->>P: forward (sealed if a keyring is set)
+    P->>P: lock object, v = epoch.(seq+1), erasure-encode
+    P->>H: 1. PUT shard v (stored as staged)
+    H-->>P: all ack
+    P->>H: 2. commit v
+    H-->>P: all ack
+    P-->>G: 200, X-Version: v
+    G-->>C: 200, X-Version: v
+```
 
 **Read.** Take the object lock. `GET` the latest committed shard from `B` slots (itself first) until `k` agree on one version. All-absent gives `404`. A disagreement, a checksum failure or fewer than `k` answers gives `503`, then re-peer. The `sha256` is verified on every shard write and read.
 
